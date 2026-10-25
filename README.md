@@ -46,6 +46,15 @@ same build runs; all tests pass (see *Results*).
    (do not unzip it).
 3. In the container (or the game shortcut's settings), set the drivers as in *Settings*.
 
+Release `1.0.0-winlator` (pre-release):
+
+```text
+zip:     panvk-g76-kirin990-1.0.0-winlator.zip
+sha256:  2123e49b8958230d89930c03dbc971fa2b2285f1e1ecbcfc76d387be73cdb728
+.so:     50e9d366cb064cd2686c60f95d5dc83cf94becaf6261ad883129c879b9528d49
+source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0018 (tree 60571fd11b)
+```
+
 The zip is a standard AdrenoTools package: one stripped `libvulkan_panfrost.so`
 (static libc++, no other libraries) and `meta.json` (`minApi` 29).
 
