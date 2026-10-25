@@ -1,0 +1,175 @@
+From ac3593667f3a60049b558e429200901329fd7106 Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 06:04:45 +0300
+Subject: [PATCH] panvk: in-process sampling profiler (PANVK_SELFPROF)
+
+---
+ src/panfrost/vulkan/panvk_instance.c | 152 +++++++++++++++++++++++++++
+ 1 file changed, 152 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index cbaadac..863902c 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -315,6 +315,158 @@ panvk_load_env_file(void)
+    fclose(f);
+ }
+ 
++/* Testing aid: PANVK_SELFPROF=1 starts an in-process sampling profiler.
++ * Every 2 ms a helper thread signals each running thread of this process and
++ * the handler records which object the interrupted PC belongs to (this
++ * driver with its offset, box64, wine, anonymous JIT code...).  A summary
++ * goes to logcat every 5 s.  Diagnostics only. */
++#include <dirent.h>
++#include <dlfcn.h>
++#include <pthread.h>
++#include <signal.h>
++#include <sys/syscall.h>
++#include <time.h>
++#include <ucontext.h>
++#include <unistd.h>
++#include "util/log.h"
++#include "util/u_atomic.h"
++
++#define SELFPROF_SIG (SIGRTMIN + 7)
++#define SELFPROF_RING 4096
++static uintptr_t selfprof_ring[SELFPROF_RING];
++static int selfprof_tids[SELFPROF_RING];
++static unsigned selfprof_head;
++
++static void
++selfprof_handler(int sig, siginfo_t *si, void *uc_)
++{
++   ucontext_t *uc = uc_;
++   unsigned i = p_atomic_inc_return(&selfprof_head) % SELFPROF_RING;
++#if defined(__aarch64__)
++   selfprof_ring[i] = (uintptr_t)uc->uc_mcontext.pc;
++#else
++   selfprof_ring[i] = 0;
++#endif
++   selfprof_tids[i] = (int)syscall(SYS_gettid);
++}
++
++struct selfprof_bucket {
++   char name[48];
++   uintptr_t off;
++   unsigned n;
++};
++
++static void
++selfprof_add(struct selfprof_bucket *b, unsigned *nb, const char *name,
++             uintptr_t off)
++{
++   for (unsigned i = 0; i < *nb; i++) {
++      if (b[i].off == off && !strcmp(b[i].name, name)) {
++         b[i].n++;
++         return;
++      }
++   }
++   if (*nb < 256) {
++      snprintf(b[*nb].name, sizeof(b[*nb].name), "%s", name);
++      b[*nb].off = off;
++      b[*nb].n = 1;
++      (*nb)++;
++   }
++}
++
++static void *
++selfprof_thread(void *arg)
++{
++   pid_t self = (pid_t)syscall(SYS_gettid);
++   unsigned last = 0;
++   uint64_t t_last = 0;
++   for (;;) {
++      DIR *d = opendir("/proc/self/task");
++      if (d) {
++         struct dirent *e;
++         while ((e = readdir(d))) {
++            int tid = atoi(e->d_name);
++            if (tid <= 0 || tid == self)
++               continue;
++            char path[64], buf[256];
++            snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
++            FILE *f = fopen(path, "r");
++            if (!f)
++               continue;
++            size_t len = fread(buf, 1, sizeof(buf) - 1, f);
++            fclose(f);
++            buf[len] = 0;
++            char *rp = strrchr(buf, ')');
++            if (rp && rp[1] == ' ' && rp[2] == 'R')
++               syscall(SYS_tgkill, getpid(), tid, SELFPROF_SIG);
++         }
++         closedir(d);
++      }
++      struct timespec ts = {0, 2000000};
++      nanosleep(&ts, NULL);
++
++      struct timespec now;
++      clock_gettime(CLOCK_MONOTONIC, &now);
++      uint64_t t = now.tv_sec * 1000ull + now.tv_nsec / 1000000;
++      if (t - t_last < 5000)
++         continue;
++      t_last = t;
++      unsigned head = p_atomic_read(&selfprof_head);
++      unsigned count = MIN2(head - last, SELFPROF_RING);
++      static struct selfprof_bucket b[256];
++      unsigned nb = 0;
++      for (unsigned k = 0; k < count; k++) {
++         unsigned i = (head - k) % SELFPROF_RING;
++         uintptr_t pc = selfprof_ring[i];
++         Dl_info info;
++         if (pc && dladdr((void *)pc, &info) && info.dli_fname) {
++            const char *base = strrchr(info.dli_fname, '/');
++            base = base ? base + 1 : info.dli_fname;
++            bool ours = strstr(base, "vulkan_panfrost") != NULL;
++            /* Group the driver per 256-byte block (addr2line later), other
++             * objects as a whole. */
++            selfprof_add(b, &nb, base,
++                         ours ? ((pc - (uintptr_t)info.dli_fbase) & ~0xffull) : 0);
++         } else {
++            selfprof_add(b, &nb, "[anon/jit]", 0);
++         }
++      }
++      last = head;
++      /* print top 25 */
++      for (unsigned r = 0; r < 25 && nb; r++) {
++         unsigned best = 0;
++         for (unsigned i = 1; i < nb; i++)
++            if (b[i].n > b[best].n)
++               best = i;
++         if (!b[best].n)
++            break;
++         mesa_logi("SELFPROF %u/%u %s+0x%lx", b[best].n, count, b[best].name,
++                   (unsigned long)b[best].off);
++         b[best].n = 0;
++      }
++   }
++   return NULL;
++}
++
++static void __attribute__((constructor(65535)))
++panvk_selfprof_start(void)
++{
++   /* Constructor order is unspecified: make sure the env file is in. */
++   panvk_load_env_file();
++   const char *e = getenv("PANVK_SELFPROF");
++   if (!e || e[0] != '1')
++      return;
++   struct sigaction sa = {0};
++   sa.sa_sigaction = selfprof_handler;
++   sa.sa_flags = SA_SIGINFO | SA_RESTART;
++   sigemptyset(&sa.sa_mask);
++   sigaction(SELFPROF_SIG, &sa, NULL);
++   pthread_t th;
++   pthread_create(&th, NULL, selfprof_thread, NULL);
++   pthread_detach(th);
++   mesa_logi("SELFPROF started");
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+                      const VkAllocationCallbacks *pAllocator,
+-- 
+2.43.0
+

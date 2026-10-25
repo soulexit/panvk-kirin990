@@ -1,0 +1,60 @@
+From 320c938b00d02bc793288a950a270cd80e325ee9 Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 03:21:55 +0300
+Subject: [PATCH 1/2] kbase: retry MEM_IMPORT with the pre-11.20 32-byte layout
+
+---
+ src/panfrost/lib/kmod/kbase_kmod.c | 37 ++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 5ad5caf..c634a1f 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -2325,6 +2325,43 @@ kbase_kmod_import_dmabuf(struct pan_kmod_dev *dev,
+          mesa_logi("kbase: mem_import via MEM_IMPORT (24 bytes)");
+    }
+ 
++   /* JM kernels before uAPI 11.20 (Kirin 990: 11.16) use a 32-byte
++    * mem_import: same field offsets, 8 more bytes of padding.  Latched as 3. */
++   if (ret && (p_atomic_read(&import_layout) == 3 || errno == ENOTTY)) {
++      union {
++         struct {
++            uint64_t flags;
++            uint64_t phandle;
++            uint32_t type;
++            uint32_t padding;
++            uint64_t padding2;
++         } in;
++         struct {
++            uint64_t flags;
++            uint64_t gpu_va;
++            uint64_t va_pages;
++            uint64_t padding;
++         } out;
++      } oreq = {
++         .in = {
++            .flags = req.in.flags,
++            .phandle = req.in.phandle,
++            .type = req.in.type,
++         },
++      };
++      static_assert(sizeof(oreq) == 32, "pre-11.20 mem_import layout");
++
++      ret = ioctl(dev->fd, _IOWR(KBASE_IOCTL_TYPE, 22, __typeof__(oreq)),
++                  &oreq);
++      if (!ret) {
++         req.out.flags = oreq.out.flags;
++         req.out.gpu_va = oreq.out.gpu_va;
++         req.out.va_pages = oreq.out.va_pages;
++         if (p_atomic_cmpxchg(&import_layout, 0, 3) == 0)
++            mesa_logi("kbase: mem_import via pre-11.20 layout (32 bytes)");
++      }
++   }
++
+    if (ret && (p_atomic_read(&import_layout) == 2 || errno == ENOTTY)) {
+       union {
+          struct {
+-- 
+2.43.0
+

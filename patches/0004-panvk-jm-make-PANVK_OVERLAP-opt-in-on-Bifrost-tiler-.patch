@@ -1,0 +1,90 @@
+From 01a05132c18c10186fbf9d048abd0f7f89b8b6fe Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 04:25:21 +0300
+Subject: [PATCH] panvk/jm: make PANVK_OVERLAP opt-in on Bifrost (tiler OOM on
+ G76)
+
+---
+ src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c |  4 +++-
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c  |  4 +++-
+ src/panfrost/vulkan/panvk_v7_knobs.h         | 16 +++++++++++++---
+ 3 files changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index f239d45..dc87af1 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -380,7 +380,9 @@ panvk_overlap_enabled(void)
+    static int on = -1;
+    if (on < 0) {
+       const char *e = getenv("PANVK_OVERLAP");
+-      on = !(e && e[0] == '0');
++      /* Bifrost: opt-in.  Two 64 MiB heap halves run out of tiler
++       * memory on large frames (kbase event 0x60) on Mali-G76. */
++      on = PAN_ARCH < 9 ? (e && e[0] == '1') : !(e && e[0] == '0');
+    }
+    return on;
+ }
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 910301a..cb0d856 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -69,7 +69,9 @@ panvk_overlap_enabled(void)
+    static int on = -1;
+    if (on < 0) {
+       const char *e = getenv("PANVK_OVERLAP");
+-      on = !(e && e[0] == '0');
++      /* Bifrost: opt-in.  Two 64 MiB heap halves run out of tiler
++       * memory on large frames (kbase event 0x60) on Mali-G76. */
++      on = PAN_ARCH < 9 ? (e && e[0] == '1') : !(e && e[0] == '0');
+    }
+    return on;
+ }
+diff --git a/src/panfrost/vulkan/panvk_v7_knobs.h b/src/panfrost/vulkan/panvk_v7_knobs.h
+index 15bdb7a..d09671a 100644
+--- a/src/panfrost/vulkan/panvk_v7_knobs.h
++++ b/src/panfrost/vulkan/panvk_v7_knobs.h
+@@ -73,6 +73,16 @@ panvk_v7_knob_texel_width(void)
+ /* Runtime-only knobs (no effect on a compile, so not hashed). */
+ 
+ /* Read "<name>=0" as off; default on. */
++static inline bool
++panvk_v7_knob_opt_in(const char *name, int *cache)
++{
++   if (*cache < 0) {
++      const char *e = getenv(name);
++      *cache = e && e[0] == '1';
++   }
++   return *cache;
++}
++
+ static inline bool
+ panvk_v7_knob_on(const char *name, int *cache)
+ {
+@@ -115,7 +125,7 @@ panvk_v7_split_heap(void)
+ {
+    static int v = -1, ov = -1;
+    return panvk_v7_knob_on("PANVK_V7_SPLIT_HEAP", &v) &&
+-          panvk_v7_knob_on("PANVK_OVERLAP", &ov);
++          panvk_v7_knob_opt_in("PANVK_OVERLAP", &ov);
+ }
+ 
+ /* jm-v7 105: the geometry emulation of a nested tess draw the CPU knows
+@@ -139,12 +149,12 @@ panvk_v7_tls_share(void)
+    return panvk_v7_knob_on("PANVK_V7_TLS_SHARE", &v);
+ }
+ 
+-/* PANVK_OVERLAP (v67b, default on), as panvk_overlap_enabled(). */
++/* PANVK_OVERLAP (v67b, default off on Bifrost), as panvk_overlap_enabled(). */
+ static inline bool
+ panvk_v7_overlap_on(void)
+ {
+    static int v = -1;
+-   return panvk_v7_knob_on("PANVK_OVERLAP", &v);
++   return panvk_v7_knob_opt_in("PANVK_OVERLAP", &v);
+ }
+ 
+ /* jm-v7 106: per-batch budget (MiB) of v6/v7 tessellation memory that is
+-- 
+2.43.0
+

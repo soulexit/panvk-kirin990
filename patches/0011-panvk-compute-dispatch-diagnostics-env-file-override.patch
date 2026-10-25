@@ -1,0 +1,124 @@
+From 1086fc126dc59036e7094cfe48afa10a405939ba Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 11:43:33 +0300
+Subject: [PATCH] panvk: compute dispatch diagnostics, env-file overrides
+
+---
+ src/panfrost/vulkan/jm/panvk_cmd_buffer.h      | 2 ++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c | 9 +++++++++
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c    | 9 +++++++--
+ src/panfrost/vulkan/panvk_instance.c           | 9 ++++++---
+ src/panfrost/vulkan/panvk_shader.h             | 4 ++++
+ src/panfrost/vulkan/panvk_vX_shader.c          | 4 ++++
+ 6 files changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+index 6171ae2..88f7ac6 100644
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -88,6 +88,8 @@ struct panvk_batch {
+    /* Diagnostics: what this batch drew, logged if its atoms fail. */
+    struct {
+       uint32_t draws, gs, tess, xfb, fb_w, fb_h;
++      uint32_t dispatches, cs_hash, wg[3], local[3];
++      bool indirect;
+       uint64_t max_verts;
+    } diag;
+ };
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c
+index 85965f0..dd5dd87 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c
+@@ -192,6 +192,15 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
+       info->direct.wg_count.z,
+    };
+    bool indirect = info->indirect.buffer_dev_addr != 0;
++   batch->diag.dispatches++;
++   batch->diag.cs_hash = cs->diag_src_hash;
++   batch->diag.wg[0] = wg_count.x;
++   batch->diag.wg[1] = wg_count.y;
++   batch->diag.wg[2] = wg_count.z;
++   batch->diag.local[0] = cs->cs.local_size.x;
++   batch->diag.local[1] = cs->cs.local_size.y;
++   batch->diag.local[2] = cs->cs.local_size.z;
++   batch->diag.indirect = indirect;
+    uint64_t tsd = panvk_per_arch(cmd_dispatch_prepare_tls)(cmdbuf, cs,
+                                                            &wg_count, indirect);
+ 
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 103185f..23760b3 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -178,11 +178,16 @@ panvk_diag_note_atom(uint64_t atom, const char *kind,
+    kbase_kmod_atom_fail_cb = panvk_diag_atom_failed;
+    snprintf(panvk_diag_atoms[atom & 255], sizeof(panvk_diag_atoms[0]),
+             "%s fb=%ux%u draws=%u gs=%u tess=%u xfb=%u max_verts=%llu "
+-            "vtc_jobs=%u frag_jobs=%u",
++            "vtc_jobs=%u frag_jobs=%u disp=%u cs=%08x wg=%ux%ux%u "
++            "local=%ux%ux%u%s",
+             kind, batch->diag.fb_w, batch->diag.fb_h, batch->diag.draws,
+             batch->diag.gs, batch->diag.tess, batch->diag.xfb,
+             (unsigned long long)batch->diag.max_verts,
+-            batch->vtc_jc.job_index, batch->frag_jc.job_index);
++            batch->vtc_jc.job_index, batch->frag_jc.job_index,
++            batch->diag.dispatches, batch->diag.cs_hash, batch->diag.wg[0],
++            batch->diag.wg[1], batch->diag.wg[2], batch->diag.local[0],
++            batch->diag.local[1], batch->diag.local[2],
++            batch->diag.indirect ? " indirect" : "");
+ }
+ 
+ static uint64_t
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index d5b5221..0906941 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -307,10 +307,13 @@ panvk_load_env_file(void)
+       if (!eq || line[0] == '#')
+          continue;
+       *eq = 0;
+-      if (strncmp(line, "PANVK_", 6) && strncmp(line, "PAN_", 4) &&
+-          strncmp(line, "MESA_", 5))
++      /* "!KEY=VALUE" replaces a variable the app already set. */
++      const bool force = line[0] == '!';
++      const char *key = force ? line + 1 : line;
++      if (strncmp(key, "PANVK_", 6) && strncmp(key, "PAN_", 4) &&
++          strncmp(key, "MESA_", 5))
+          continue;
+-      setenv(line, eq + 1, 0);
++      setenv(key, eq + 1, force);
+    }
+    fclose(f);
+ }
+diff --git a/src/panfrost/vulkan/panvk_shader.h b/src/panfrost/vulkan/panvk_shader.h
+index fb89f1b..a775d24 100644
+--- a/src/panfrost/vulkan/panvk_shader.h
++++ b/src/panfrost/vulkan/panvk_shader.h
+@@ -461,6 +461,10 @@ struct panvk_shader_desc_info {
+ struct panvk_shader_variant {
+    struct pan_shader_info info;
+ 
++   /* Diagnostics: first 4 bytes of the SPIR-V blake3 (MESA_SPIRV_DUMP_PATH
++    * file name), 0 when loaded from the shader cache. */
++   uint32_t diag_src_hash;
++
+    union {
+       struct {
+          struct pan_compute_dim local_size;
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index f6fece6..1dd4e02 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -3497,6 +3497,10 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
+ {
+    const bool dump_asm =
+       shader_flags & VK_SHADER_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_MESA;
++   shader->diag_src_hash = (uint32_t)nir->info.source_blake3[0] << 24 |
++                           (uint32_t)nir->info.source_blake3[1] << 16 |
++                           (uint32_t)nir->info.source_blake3[2] << 8 |
++                           nir->info.source_blake3[3];
+ 
+    /* We're going to modify this so make our own copy to be nicer to callers */
+    struct pan_compile_inputs input = *compile_input;
+-- 
+2.43.0
+

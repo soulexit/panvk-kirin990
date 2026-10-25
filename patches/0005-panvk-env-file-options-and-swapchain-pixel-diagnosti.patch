@@ -1,0 +1,239 @@
+From d3f41541ce6373b2f3de15b403f20b1b1f3fc4cb Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 04:43:28 +0300
+Subject: [PATCH] panvk: env-file options and swapchain pixel diagnostics
+ (PANVK_G76_DIAG)
+
+---
+ src/panfrost/lib/kmod/kbase_kmod.c          | 99 +++++++++++++++++++++
+ src/panfrost/lib/kmod/kbase_kmod.h          |  2 +
+ src/panfrost/vulkan/panvk_image.c           |  5 ++
+ src/panfrost/vulkan/panvk_instance.c        | 27 ++++++
+ src/panfrost/vulkan/panvk_physical_device.c |  2 +
+ 5 files changed, 135 insertions(+)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index c634a1f..4955a4c 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -55,6 +55,7 @@
+ #include "util/log.h"
+ #include "util/list.h"
+ #include "util/u_debug.h"
++#include "util/simple_mtx.h"
+ 
+ #include "drm-uapi/mali_kbase_ioctl.h"
+ /* Only used as the interchange format for CSF interface information; no
+@@ -2261,6 +2262,102 @@ kbase_kmod_bo_import_host(struct pan_kmod_dev *dev, void *host_ptr,
+    return &kbase_bo->base;
+ }
+ 
++/* G76 diagnostics (PANVK_G76_DIAG=1): remember imported dma-bufs (WSI
++ * swapchain AHBs) so a frame-completion hook can log whether their pixels
++ * are black.  Rate limited; read-only temporary mappings. */
++#define KBASE_DIAG_MAX 16
++static struct {
++   const void *bo;
++   int fd;
++   uint64_t size;
++} kbase_diag_imports[KBASE_DIAG_MAX];
++static simple_mtx_t kbase_diag_lock = SIMPLE_MTX_INITIALIZER;
++
++static bool
++kbase_diag_on(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *e = getenv("PANVK_G76_DIAG");
++      on = e && e[0] == '1';
++   }
++   return on;
++}
++
++static void
++kbase_diag_track(const void *bo, int fd, uint64_t size)
++{
++   if (!kbase_diag_on())
++      return;
++   simple_mtx_lock(&kbase_diag_lock);
++   for (unsigned i = 0; i < KBASE_DIAG_MAX; i++) {
++      if (!kbase_diag_imports[i].bo) {
++         kbase_diag_imports[i].bo = bo;
++         kbase_diag_imports[i].fd = fd;
++         kbase_diag_imports[i].size = size;
++         break;
++      }
++   }
++   simple_mtx_unlock(&kbase_diag_lock);
++}
++
++static void
++kbase_diag_untrack(const void *bo)
++{
++   if (!kbase_diag_on())
++      return;
++   simple_mtx_lock(&kbase_diag_lock);
++   for (unsigned i = 0; i < KBASE_DIAG_MAX; i++)
++      if (kbase_diag_imports[i].bo == bo)
++         kbase_diag_imports[i].bo = NULL;
++   simple_mtx_unlock(&kbase_diag_lock);
++}
++
++void
++kbase_kmod_diag_sample_imports(const char *why)
++{
++   if (!kbase_diag_on())
++      return;
++   static uint64_t last_ns;
++   uint64_t now = os_time_get_nano();
++   if (now - last_ns < 2000000000ull)
++      return;
++   last_ns = now;
++
++   simple_mtx_lock(&kbase_diag_lock);
++   for (unsigned i = 0; i < KBASE_DIAG_MAX; i++) {
++      if (!kbase_diag_imports[i].bo)
++         continue;
++      int fd = kbase_diag_imports[i].fd;
++      uint64_t size = kbase_diag_imports[i].size;
++      void *p = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
++      if (p == MAP_FAILED) {
++         mesa_logi("G76DIAG %s buf%u fd=%d size=%" PRIu64 " mmap failed: %s",
++                   why, i, fd, size, strerror(errno));
++         continue;
++      }
++      struct dma_buf_sync sync = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
++      ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
++      const uint32_t *w = p;
++      uint64_t n = size / 4, step = MAX2(n / 4096, 1), nonzero = 0, samples = 0;
++      uint32_t first_nz = 0, mid = w[n / 2];
++      for (uint64_t k = 0; k < n; k += step, samples++) {
++         if (w[k] & 0x00ffffff) {
++            if (!nonzero)
++               first_nz = w[k];
++            nonzero++;
++         }
++      }
++      sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
++      ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
++      munmap(p, size);
++      mesa_logi("G76DIAG %s buf%u size=%" PRIu64 " nonblack=%" PRIu64 "/%" PRIu64
++                " first=0x%08x mid=0x%08x", why, i, size, nonzero, samples,
++                first_nz, mid);
++   }
++   simple_mtx_unlock(&kbase_diag_lock);
++}
++
+ static struct pan_kmod_bo *
+ kbase_kmod_import_dmabuf(struct pan_kmod_dev *dev,
+                          struct pan_kmod_vm *exclusive_vm, int fd,
+@@ -2484,6 +2581,7 @@ kbase_kmod_import_dmabuf(struct pan_kmod_dev *dev,
+              (unsigned long long)req.out.gpu_va,
+              (unsigned long long)req.out.va_pages,
+              (unsigned long long)req.out.flags);
++   kbase_diag_track(kbase_bo, kbase_bo->dmabuf_fd, bo_size);
+    return &kbase_bo->base;
+ 
+ err_unmap_gpu:
+@@ -2791,6 +2889,7 @@ kbase_kmod_bo_free(struct pan_kmod_bo *bo)
+          mesa_loge("kbase: KBASE_IOCTL_MEM_FREE failed: %s", strerror(errno));
+    }
+ 
++   kbase_diag_untrack(kbase_bo);
+    if (kbase_bo->dmabuf_fd >= 0)
+       close(kbase_bo->dmabuf_fd);
+ 
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.h b/src/panfrost/lib/kmod/kbase_kmod.h
+index 4020bcc..b4d4b09 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.h
++++ b/src/panfrost/lib/kmod/kbase_kmod.h
+@@ -151,6 +151,8 @@ int kbase_kmod_csf_wait_cqs64(struct pan_kmod_dev *dev, uint64_t addr,
+                               uint64_t target_minus_one,
+                               int64_t timeout_ns);
+ 
++void kbase_kmod_diag_sample_imports(const char *why);
++
+ int kbase_kmod_csf_export_cqs64_fence(struct pan_kmod_dev *dev,
+                                       const uint64_t *addrs,
+                                       const uint64_t *targets_minus_one,
+diff --git a/src/panfrost/vulkan/panvk_image.c b/src/panfrost/vulkan/panvk_image.c
+index b83814d..d6b4fcf 100644
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -325,6 +325,11 @@ panvk_image_get_explicit_mod(
+ {
+    uint64_t mod = explicit->drmFormatModifier;
+ 
++   /* Winlator's wrapper passes DRM_FORMAT_MOD_INVALID for gralloc buffers
++    * whose modifier it does not know; those are linear. */
++   if (mod == DRM_FORMAT_MOD_INVALID)
++      mod = DRM_FORMAT_MOD_LINEAR;
++
+    assert(!vk_format_is_depth_or_stencil(image->vk.format));
+    assert(image->vk.samples == 1);
+    assert(image->vk.image_type != VK_IMAGE_TYPE_3D);
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index 74520c4..cbaadac 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -1,3 +1,5 @@
++#include <string.h>
++#include <stdlib.h>
+ /*
+  * Copyright © 2021 Collabora Ltd.
+  * Copyright © 2026 NXP
+@@ -288,6 +290,31 @@ panvk_init_dri_options(struct panvk_instance *instance)
+                            });
+ }
+ 
++/* Testing aid: KEY=VALUE lines from /sdcard/Download/panvk_env.txt are put
++ * in the environment when the driver is loaded, so options can be changed
++ * inside apps (Winlator) whose environment cannot be edited.  Only PANVK_*,
++ * PAN_* and MESA_* keys; existing variables are kept. */
++static void __attribute__((constructor))
++panvk_load_env_file(void)
++{
++   FILE *f = fopen("/sdcard/Download/panvk_env.txt", "r");
++   if (!f)
++      return;
++   char line[256];
++   while (fgets(line, sizeof(line), f)) {
++      line[strcspn(line, "\r\n")] = 0;
++      char *eq = strchr(line, '=');
++      if (!eq || line[0] == '#')
++         continue;
++      *eq = 0;
++      if (strncmp(line, "PANVK_", 6) && strncmp(line, "PAN_", 4) &&
++          strncmp(line, "MESA_", 5))
++         continue;
++      setenv(line, eq + 1, 0);
++   }
++   fclose(f);
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+                      const VkAllocationCallbacks *pAllocator,
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index b3dfe8a..02d5b67 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -694,6 +694,7 @@ kbase_cpu_sync_signal(UNUSED struct vk_device *device, struct vk_sync *sync,
+                       UNUSED uint64_t value)
+ {
+    struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
++   kbase_kmod_diag_sample_imports("sync_signal");
+    mtx_lock(&ks->mutex);
+    ks->state = KBASE_CPU_SYNC_SIGNALED;
+    ks->result = VK_SUCCESS;
+@@ -1146,6 +1147,7 @@ kbase_cpu_sync_export_sync_file_jm(struct vk_device *device,
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   kbase_kmod_diag_sample_imports("sync_export");
+    *sync_file = -1;
+    return VK_SUCCESS;
+ }
+-- 
+2.43.0
+

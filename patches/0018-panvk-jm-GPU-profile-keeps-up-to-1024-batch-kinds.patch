@@ -1,0 +1,43 @@
+From 60571fd11b71e8bba7b8d18040750949f2830a4f Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 13:24:28 +0300
+Subject: [PATCH] panvk/jm: GPU profile keeps up to 1024 batch kinds
+
+---
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index cb1ed5a..c092bd4 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -179,7 +179,7 @@ struct panvk_gprof_kind {
+    char sig[128];
+    uint64_t ns, count, draws;
+ };
+-static struct panvk_gprof_kind panvk_gprof_kinds[64];
++static struct panvk_gprof_kind panvk_gprof_kinds[1024];
+ static unsigned panvk_gprof_nkinds;
+ static uint64_t panvk_gprof_submit_ns[256];
+ static int panvk_gprof_kind_of[256];
+@@ -218,7 +218,7 @@ panvk_gprof_report_locked(uint64_t now)
+    const uint64_t cw = p_atomic_xchg(&panvk_kbase_cpu_wait_ns, 0);
+    const uint32_t cc = p_atomic_xchg(&panvk_kbase_cpu_wait_count, 0);
+    const uint64_t cm = p_atomic_xchg(&panvk_kbase_cpu_wait_max_ns, 0);
+-   mesa_logi("GPROF window %.1fs: GPU busy %.0f ms/s over %u kinds; "
++   mesa_logi("GPROF window %.1fs: attributed %.0f ms/s over %u kinds; "
+              "sync-file export waits %.0f ms/s (%.0f/s); CPU waits %.0f ms/s "
+              "(%.0f/s, max %.1f ms); submits %.0f/s", secs,
+              total / 1e6 / secs, panvk_gprof_nkinds, ew / 1e6 / secs, ec / secs,
+@@ -231,7 +231,7 @@ panvk_gprof_report_locked(uint64_t now)
+              panvk_gprof_inflight_ns / 1e6 / secs);
+    panvk_gprof_lat_ns = panvk_gprof_lat_max = panvk_gprof_lat_n = 0;
+    panvk_gprof_inflight_ns = 0;
+-   for (unsigned r = 0; r < 12; r++) {
++   for (unsigned r = 0; r < 16; r++) {
+       int best = -1;
+       for (unsigned i = 0; i < panvk_gprof_nkinds; i++)
+          if (panvk_gprof_kinds[i].ns &&
+-- 
+2.43.0
+

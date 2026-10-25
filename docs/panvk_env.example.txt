@@ -1,0 +1,8 @@
+# Copy to /sdcard/Download/panvk_env.txt to enable options at driver load.
+# KEY=VALUE (PANVK_*, PAN_*, MESA_*); "!KEY=VALUE" overrides a value the app set.
+# Delete the file (or leave only comments) for normal use.
+#PANVK_GPU_PROF=1
+#PANVK_G76_DIAG=1
+#PANVK_HIDE_EXTS=VK_KHR_incremental_present
+#MESA_SPIRV_DUMP_PATH=/sdcard/Download/spv
+#!MESA_SHADER_CACHE_DISABLE=true

@@ -1,0 +1,73 @@
+From 5798e4913d0f063712e7894615b642d3ba72ef50 Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 13:21:00 +0300
+Subject: [PATCH] panvk/jm: submit-to-done latency and in-flight time in GPU
+ profile
+
+---
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c | 28 ++++++++++++++++++++-
+ 1 file changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index f83512e..cb1ed5a 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -186,6 +186,9 @@ static int panvk_gprof_kind_of[256];
+ static uint32_t panvk_gprof_draws_of[256];
+ static uint64_t panvk_gprof_last_done, panvk_gprof_window;
+ static uint32_t panvk_gprof_submits;
++static uint64_t panvk_gprof_lat_ns, panvk_gprof_lat_max, panvk_gprof_lat_n;
++static uint64_t panvk_gprof_inflight_ns, panvk_gprof_last_t;
++static int panvk_gprof_inflight;
+ static simple_mtx_t panvk_gprof_lock = SIMPLE_MTX_INITIALIZER;
+ 
+ static bool
+@@ -221,6 +224,13 @@ panvk_gprof_report_locked(uint64_t now)
+              total / 1e6 / secs, panvk_gprof_nkinds, ew / 1e6 / secs, ec / secs,
+              cw / 1e6 / secs, cc / secs, cm / 1e6, panvk_gprof_submits / secs);
+    panvk_gprof_submits = 0;
++   mesa_logi("GPROF atoms: submit->done avg %.2f ms max %.1f ms (%llu); "
++             "time with >=1 atom in flight %.0f ms/s",
++             panvk_gprof_lat_n ? panvk_gprof_lat_ns / 1e6 / panvk_gprof_lat_n : 0,
++             panvk_gprof_lat_max / 1e6, (unsigned long long)panvk_gprof_lat_n,
++             panvk_gprof_inflight_ns / 1e6 / secs);
++   panvk_gprof_lat_ns = panvk_gprof_lat_max = panvk_gprof_lat_n = 0;
++   panvk_gprof_inflight_ns = 0;
+    for (unsigned r = 0; r < 12; r++) {
+       int best = -1;
+       for (unsigned i = 0; i < panvk_gprof_nkinds; i++)
+@@ -248,6 +258,17 @@ panvk_gprof_done(unsigned atom)
+    simple_mtx_lock(&panvk_gprof_lock);
+    const uint64_t now = os_time_get_nano();
+    const int k = panvk_gprof_kind_of[atom & 255];
++   if (panvk_gprof_submit_ns[atom & 255]) {
++      const uint64_t lat = now - panvk_gprof_submit_ns[atom & 255];
++      panvk_gprof_lat_ns += lat;
++      panvk_gprof_lat_n++;
++      if (lat > panvk_gprof_lat_max)
++         panvk_gprof_lat_max = lat;
++      if (panvk_gprof_inflight > 0)
++         panvk_gprof_inflight_ns += now - panvk_gprof_last_t;
++      panvk_gprof_last_t = now;
++      panvk_gprof_inflight--;
++   }
+    if (k >= 0 && panvk_gprof_submit_ns[atom & 255]) {
+       uint64_t start = MAX2(panvk_gprof_submit_ns[atom & 255],
+                             panvk_gprof_last_done);
+@@ -294,7 +315,12 @@ panvk_gprof_submit(uint64_t atom, const char *kind,
+                "%s", sig);
+    }
+    panvk_gprof_kind_of[atom & 255] = k;
+-   panvk_gprof_submit_ns[atom & 255] = os_time_get_nano();
++   const uint64_t snow = os_time_get_nano();
++   if (panvk_gprof_inflight > 0)
++      panvk_gprof_inflight_ns += snow - panvk_gprof_last_t;
++   panvk_gprof_last_t = snow;
++   panvk_gprof_inflight++;
++   panvk_gprof_submit_ns[atom & 255] = snow;
+    panvk_gprof_draws_of[atom & 255] = batch->diag.draws;
+    kbase_kmod_atom_done_cb = panvk_gprof_done;
+    simple_mtx_unlock(&panvk_gprof_lock);
+-- 
+2.43.0
+

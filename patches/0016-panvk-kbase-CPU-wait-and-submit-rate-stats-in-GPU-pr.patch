@@ -1,0 +1,99 @@
+From ef6e98d6724ffa13dd1252617ea75ca9092cdd0a Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 13:16:07 +0300
+Subject: [PATCH] panvk/kbase: CPU wait and submit-rate stats in GPU profile
+
+---
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c | 14 ++++++++--
+ src/panfrost/vulkan/panvk_physical_device.c | 30 +++++++++++++++++++++
+ 2 files changed, 42 insertions(+), 2 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 9465b29..f83512e 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -185,6 +185,7 @@ static uint64_t panvk_gprof_submit_ns[256];
+ static int panvk_gprof_kind_of[256];
+ static uint32_t panvk_gprof_draws_of[256];
+ static uint64_t panvk_gprof_last_done, panvk_gprof_window;
++static uint32_t panvk_gprof_submits;
+ static simple_mtx_t panvk_gprof_lock = SIMPLE_MTX_INITIALIZER;
+ 
+ static bool
+@@ -209,9 +210,17 @@ panvk_gprof_report_locked(uint64_t now)
+    extern uint32_t panvk_kbase_export_count;
+    const uint64_t ew = p_atomic_xchg(&panvk_kbase_export_wait_ns, 0);
+    const uint32_t ec = p_atomic_xchg(&panvk_kbase_export_count, 0);
++   extern uint64_t panvk_kbase_cpu_wait_ns, panvk_kbase_cpu_wait_max_ns;
++   extern uint32_t panvk_kbase_cpu_wait_count;
++   const uint64_t cw = p_atomic_xchg(&panvk_kbase_cpu_wait_ns, 0);
++   const uint32_t cc = p_atomic_xchg(&panvk_kbase_cpu_wait_count, 0);
++   const uint64_t cm = p_atomic_xchg(&panvk_kbase_cpu_wait_max_ns, 0);
+    mesa_logi("GPROF window %.1fs: GPU busy %.0f ms/s over %u kinds; "
+-             "sync-file export waits %.0f ms/s (%.0f/s)", secs,
+-             total / 1e6 / secs, panvk_gprof_nkinds, ew / 1e6 / secs, ec / secs);
++             "sync-file export waits %.0f ms/s (%.0f/s); CPU waits %.0f ms/s "
++             "(%.0f/s, max %.1f ms); submits %.0f/s", secs,
++             total / 1e6 / secs, panvk_gprof_nkinds, ew / 1e6 / secs, ec / secs,
++             cw / 1e6 / secs, cc / secs, cm / 1e6, panvk_gprof_submits / secs);
++   panvk_gprof_submits = 0;
+    for (unsigned r = 0; r < 12; r++) {
+       int best = -1;
+       for (unsigned i = 0; i < panvk_gprof_nkinds; i++)
+@@ -565,6 +574,7 @@ panvk_jm_kbase_wait_atoms(void *data, const uint64_t targets[PANVK_KBASE_SYNC_TA
+ VkResult
+ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+ {
++   panvk_gprof_submits++;
+    struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
+    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+    (void)0;
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index b5c36a6..e589b21 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -889,11 +889,41 @@ kbase_cpu_sync_wait_one(struct vk_device *device, struct kbase_cpu_sync *ks,
+    }
+ }
+ 
++uint64_t panvk_kbase_cpu_wait_ns, panvk_kbase_cpu_wait_max_ns;
++uint32_t panvk_kbase_cpu_wait_count;
++
++static VkResult
++kbase_cpu_sync_wait_many_impl(struct vk_device *device, uint32_t wait_count,
++                              const struct vk_sync_wait *waits,
++                              enum vk_sync_wait_flags wait_flags,
++                              uint64_t abs_timeout_ns);
++
++/* Time the CPU spends blocked here (GPU profile, PANVK_GPU_PROF). */
+ static VkResult
+ kbase_cpu_sync_wait_many(struct vk_device *device,
+                          uint32_t wait_count, const struct vk_sync_wait *waits,
+                          enum vk_sync_wait_flags wait_flags,
+                          uint64_t abs_timeout_ns)
++{
++   if (abs_timeout_ns == 0)
++      return kbase_cpu_sync_wait_many_impl(device, wait_count, waits,
++                                           wait_flags, abs_timeout_ns);
++   const uint64_t t0 = os_time_get_nano();
++   VkResult r = kbase_cpu_sync_wait_many_impl(device, wait_count, waits,
++                                              wait_flags, abs_timeout_ns);
++   const uint64_t dt = os_time_get_nano() - t0;
++   p_atomic_add(&panvk_kbase_cpu_wait_ns, dt);
++   p_atomic_inc(&panvk_kbase_cpu_wait_count);
++   if (dt > panvk_kbase_cpu_wait_max_ns)
++      panvk_kbase_cpu_wait_max_ns = dt;
++   return r;
++}
++
++static VkResult
++kbase_cpu_sync_wait_many_impl(struct vk_device *device,
++                              uint32_t wait_count, const struct vk_sync_wait *waits,
++                              enum vk_sync_wait_flags wait_flags,
++                              uint64_t abs_timeout_ns)
+ {
+    bool wait_any = !!(wait_flags & VK_SYNC_WAIT_ANY);
+ 
+-- 
+2.43.0
+

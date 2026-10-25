@@ -1,0 +1,27 @@
+From f320a31e699145b5c2fcffe7d68b1a2a562d0f8d Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 06:07:06 +0300
+Subject: [PATCH] panvk: no SELFPROF in ART processes
+
+---
+ src/panfrost/vulkan/panvk_instance.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index 863902c..d5b5221 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -456,6 +456,10 @@ panvk_selfprof_start(void)
+    const char *e = getenv("PANVK_SELFPROF");
+    if (!e || e[0] != '1')
+       return;
++   /* Never in Android app processes (Winlator's X server): ART owns the
++    * real-time signals and dies on a foreign one. */
++   if (dlopen("libart.so", RTLD_NOW | RTLD_NOLOAD))
++      return;
+    struct sigaction sa = {0};
+    sa.sa_sigaction = selfprof_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+-- 
+2.43.0
+

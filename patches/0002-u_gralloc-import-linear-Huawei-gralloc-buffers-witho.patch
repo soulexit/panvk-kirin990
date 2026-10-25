@@ -1,0 +1,53 @@
+From 24aa1d2e42196dd48ad52be54823f86caf91f290 Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 03:24:30 +0300
+Subject: [PATCH 2/2] u_gralloc: import linear Huawei gralloc buffers without
+ mapper4 metadata
+
+---
+ src/util/u_gralloc/u_gralloc_fallback.c | 29 +++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/src/util/u_gralloc/u_gralloc_fallback.c b/src/util/u_gralloc/u_gralloc_fallback.c
+index 3630434..9a85d1c 100644
+--- a/src/util/u_gralloc/u_gralloc_fallback.c
++++ b/src/util/u_gralloc/u_gralloc_fallback.c
+@@ -655,6 +655,35 @@ fallback_gralloc_get_buffer_info(struct u_gralloc *gralloc,
+ 
+ 
+    int stable_ret = panvk_v19_query_mapper(hnd->handle, out);
++
++   /* Huawei/HiSilicon gralloc (Kirin, EMUI 10-12) has no mapper4 metadata,
++    * but its private_handle_t (magic 0x03141592 in data[2]) carries the
++    * layout: data[6] low byte is the AFBC flag, data[8] the pixel stride and data[9]
++    * the bytes per pixel.
++    * Linear buffers can be imported from those fields directly. */
++   if (stable_ret != 0 && hnd->handle->numInts >= 0x51 &&
++       (unsigned)hnd->handle->data[2] == 0x03141592u) {
++      const int *d = hnd->handle->data;
++      bool afbc = (d[6] & 0xff) != 0;
++      static bool logged;
++      if (!logged) {
++         mesa_logi("Huawei gralloc handle: %dx%d fmt=0x%x isAfbc=%u "
++                   "pixelStride=%u bpp=%u",
++                   d[31], d[32], d[3], d[6] & 0xff, d[8], d[9]);
++         logged = true;
++      }
++      if (!afbc && d[8] > 0 && d[9] > 0) {
++         out->drm_fourcc = drm_fourcc;
++         out->modifier = DRM_FORMAT_MOD_LINEAR;
++         out->num_planes = 1;
++         out->fds[0] = hnd->handle->data[0];
++         out->offsets[0] = 0;
++         out->strides[0] = d[8] * d[9];
++         return 0;
++      }
++      mesa_logw("Huawei gralloc: AFBC buffer cannot be imported");
++   }
++
+    if (stable_ret != 0) {
+       mesa_logw("[P0A-V19-FULLPLANE] complete metadata unavailable rc=%d; refusing guessed layout",
+                 stable_ret);
+-- 
+2.43.0
+

@@ -1,0 +1,66 @@
+From 364ab9dda28352cdf37f4b315f858b99487eaeac Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 04:06:57 +0300
+Subject: [PATCH] panvk/kbase: export JM sync files as signaled (-1) after a
+ CPU wait
+
+---
+ src/panfrost/vulkan/panvk_physical_device.c | 35 ++++++++++++++++++++-
+ 1 file changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index 259242a..b3dfe8a 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -1118,6 +1118,38 @@ out:
+    return VK_SUCCESS;
+ }
+ 
++/* JM has no CQS fence export: wait for the payload on the CPU and hand out
++ * -1, which the Vulkan spec allows for an already-signaled SYNC_FD.  Without
++ * any export_sync_file the runtime drops SYNC_FD semaphores entirely, which
++ * breaks WSI layers (Winlator's wrapper) that import acquire sync files. */
++static VkResult
++kbase_cpu_sync_export_sync_file_jm(struct vk_device *device,
++                                   struct vk_sync *sync, int *sync_file)
++{
++   struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
++
++   mtx_lock(&ks->mutex);
++   if (ks->pending_wait == kbase_sync_file_wait_func && ks->pending_data) {
++      struct kbase_sync_file_waiter *waiter = ks->pending_data;
++      int fd = dup(waiter->fd);
++      mtx_unlock(&ks->mutex);
++      if (fd < 0)
++         return vk_errorf(device, VK_ERROR_TOO_MANY_OBJECTS,
++                          "sync_file dup failed: %m");
++      *sync_file = fd;
++      return VK_SUCCESS;
++   }
++   mtx_unlock(&ks->mutex);
++
++   VkResult result =
++      kbase_cpu_sync_wait_one(device, ks, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
++   if (result != VK_SUCCESS)
++      return result;
++
++   *sync_file = -1;
++   return VK_SUCCESS;
++}
++
+ static const struct vk_sync_type kbase_cpu_sync_type = {
+    .size      = sizeof(struct kbase_cpu_sync),
+    .features  = VK_SYNC_FEATURE_BINARY |
+@@ -1151,7 +1183,8 @@ get_device_sync_types_kbase(struct panvk_physical_device *device,
+ 
+    device->drm_syncobj_type = kbase_cpu_sync_type;
+    if (pan_arch(device->kmod.dev->props.gpu_id) < 10)
+-      device->drm_syncobj_type.export_sync_file = NULL;
++      device->drm_syncobj_type.export_sync_file =
++         kbase_cpu_sync_export_sync_file_jm;
+ 
+    /* Binary CPU sync first (fences need a binary type with CPU_RESET),
+     * software timeline emulation second (timeline semaphores).  Submitted
+-- 
+2.43.0
+

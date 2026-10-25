@@ -1,0 +1,96 @@
+From 3508d5f0503750dfa9b929e553f6cc5ebd084c6d Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 13:00:23 +0300
+Subject: [PATCH] panvk/jm: record batch opener and precomp kernel in GPU
+ profile
+
+---
+ src/panfrost/vulkan/jm/panvk_cmd_buffer.h     |  3 +++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c  |  2 ++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c |  2 ++
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c   | 15 +++++++++++----
+ 4 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+index 88f7ac6..e0ee48e 100644
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -89,6 +89,9 @@ struct panvk_batch {
+    struct {
+       uint32_t draws, gs, tess, xfb, fb_w, fb_h;
+       uint32_t dispatches, cs_hash, wg[3], local[3];
++      uintptr_t opener; /* return address of cmd_open_batch's caller */
++      int precomp; /* last precompiled kernel, -1 = none */
++      uint32_t precomp_n;
+       bool indirect;
+       uint64_t max_verts;
+    } diag;
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index dc87af1..3792412 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -511,6 +511,8 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
+       vk_zalloc(&cmdbuf->vk.pool->alloc, sizeof(*cmdbuf->cur_batch), 8,
+                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+    cmdbuf->cur_batch->jobs = UTIL_DYNARRAY_INIT;
++   cmdbuf->cur_batch->diag.opener = (uintptr_t)__builtin_return_address(0);
++   cmdbuf->cur_batch->diag.precomp = -1;
+ #if PAN_ARCH == 9
+    cmdbuf->cur_batch->malloc_vertex_jobs = UTIL_DYNARRAY_INIT;
+ #endif
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c
+index 694b274..0e990d5 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c
+@@ -34,6 +34,8 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
+    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+    const struct panvk_shader_variant *shader =
+       panvk_per_arch(precomp_cache_get)(dev->precomp_cache, idx);
++   batch->diag.precomp = idx;
++   batch->diag.precomp_n++;
+ 
+    assert(shader);
+    assert(batch && "Need current batch to be present!");
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 78b84aa..ee01443 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -34,6 +34,7 @@
+ 
+ /* ---- P4 trace ---- */
+ #include <stdio.h>
++#include <dlfcn.h>
+ #include <unistd.h>
+ 
+ /* ---- PANVK_TRACE gate: debug fprintf(stderr) only when PANVK_TRACE=1 ---- */
+@@ -175,7 +176,7 @@ panvk_diag_atom_failed(unsigned atom)
+  * its submission and the previous completion.  Top kinds are logged every
+  * 5 s as ms of GPU time per second. */
+ struct panvk_gprof_kind {
+-   char sig[96];
++   char sig[128];
+    uint64_t ns, count, draws;
+ };
+ static struct panvk_gprof_kind panvk_gprof_kinds[64];
+@@ -254,9 +255,15 @@ static void
+ panvk_gprof_submit(uint64_t atom, const char *kind,
+                    const struct panvk_batch *batch)
+ {
+-   char sig[96];
+-   snprintf(sig, sizeof(sig), "%s fb=%ux%u%s%s%s cs=%08x wg=%ux%ux%u l=%ux%u",
+-            kind, batch->diag.fb_w, batch->diag.fb_h,
++   char sig[128];
++   Dl_info dli;
++   uintptr_t op = batch->diag.opener;
++   if (op && dladdr((void *)op, &dli) && dli.dli_fbase)
++      op -= (uintptr_t)dli.dli_fbase;
++   snprintf(sig, sizeof(sig),
++            "%s op=%lx pc=%d/%u fb=%ux%u%s%s%s cs=%08x wg=%ux%ux%u l=%ux%u",
++            kind, (unsigned long)op, batch->diag.precomp,
++            batch->diag.precomp_n, batch->diag.fb_w, batch->diag.fb_h,
+             batch->diag.gs ? " gs" : "", batch->diag.tess ? " tess" : "",
+             batch->diag.xfb ? " xfb" : "",
+             batch->diag.dispatches ? batch->diag.cs_hash : 0,
+-- 
+2.43.0
+

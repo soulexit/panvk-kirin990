@@ -1,0 +1,183 @@
+From 807d84d6936962d635000edd42a1666123cfc010 Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 12:54:37 +0300
+Subject: [PATCH] panvk/jm: per-batch GPU time profiler (PANVK_GPU_PROF)
+
+---
+ src/panfrost/lib/kmod/kbase_kmod.c          |   3 +
+ src/panfrost/lib/kmod/kbase_kmod.h          |   1 +
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c | 112 ++++++++++++++++++++
+ 3 files changed, 116 insertions(+)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 917d39e..117a537 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -2314,6 +2314,7 @@ kbase_diag_untrack(const void *bo)
+ }
+ 
+ void (*kbase_kmod_atom_fail_cb)(unsigned atom);
++void (*kbase_kmod_atom_done_cb)(unsigned atom);
+ 
+ void
+ kbase_kmod_diag_sample_imports(const char *why)
+@@ -3242,6 +3243,8 @@ kbase_atom_process_event_locked(struct kbase_kmod_dev *kd,
+                                  const struct base_jd_event_v2 *ev)
+ {
+    unsigned num = ev->atom_number;
++   if (kbase_kmod_atom_done_cb)
++      kbase_kmod_atom_done_cb(num);
+    bool errored = ev->event_code != BASE_JD_EVENT_DONE;
+    kd->last_event_code[num] = ev->event_code;
+    kd->atom_failed[num] = errored;
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.h b/src/panfrost/lib/kmod/kbase_kmod.h
+index 43559e9..fdab8e9 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.h
++++ b/src/panfrost/lib/kmod/kbase_kmod.h
+@@ -153,6 +153,7 @@ int kbase_kmod_csf_wait_cqs64(struct pan_kmod_dev *dev, uint64_t addr,
+ 
+ void kbase_kmod_diag_sample_imports(const char *why);
+ extern void (*kbase_kmod_atom_fail_cb)(unsigned atom);
++extern void (*kbase_kmod_atom_done_cb)(unsigned atom);
+ 
+ int kbase_kmod_csf_export_cqs64_fence(struct pan_kmod_dev *dev,
+                                       const uint64_t *addrs,
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 23760b3..78b84aa 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -27,6 +27,7 @@
+ #include "panvk_priv_bo.h"
+ #include "panvk_queue.h"
+ #include "util/os_time.h"
++#include "util/simple_mtx.h"
+ 
+ #include "vk_framebuffer.h"
+ #include "vk_sync.h"
+@@ -169,12 +170,123 @@ panvk_diag_atom_failed(unsigned atom)
+                                              : "(unknown)");
+ }
+ 
++/* PANVK_GPU_PROF=1: GPU time per batch kind.  Atoms of a queue run in
++ * order, so an atom's GPU time is its completion time minus the later of
++ * its submission and the previous completion.  Top kinds are logged every
++ * 5 s as ms of GPU time per second. */
++struct panvk_gprof_kind {
++   char sig[96];
++   uint64_t ns, count, draws;
++};
++static struct panvk_gprof_kind panvk_gprof_kinds[64];
++static unsigned panvk_gprof_nkinds;
++static uint64_t panvk_gprof_submit_ns[256];
++static int panvk_gprof_kind_of[256];
++static uint32_t panvk_gprof_draws_of[256];
++static uint64_t panvk_gprof_last_done, panvk_gprof_window;
++static simple_mtx_t panvk_gprof_lock = SIMPLE_MTX_INITIALIZER;
++
++static bool
++panvk_gprof_on(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *e = getenv("PANVK_GPU_PROF");
++      on = e && e[0] == '1';
++   }
++   return on;
++}
++
++static void
++panvk_gprof_report_locked(uint64_t now)
++{
++   const double secs = (now - panvk_gprof_window) / 1e9;
++   uint64_t total = 0;
++   for (unsigned i = 0; i < panvk_gprof_nkinds; i++)
++      total += panvk_gprof_kinds[i].ns;
++   mesa_logi("GPROF window %.1fs: GPU busy %.0f ms/s over %u kinds", secs,
++             total / 1e6 / secs, panvk_gprof_nkinds);
++   for (unsigned r = 0; r < 12; r++) {
++      int best = -1;
++      for (unsigned i = 0; i < panvk_gprof_nkinds; i++)
++         if (panvk_gprof_kinds[i].ns &&
++             (best < 0 || panvk_gprof_kinds[i].ns > panvk_gprof_kinds[best].ns))
++            best = i;
++      if (best < 0)
++         break;
++      struct panvk_gprof_kind *k = &panvk_gprof_kinds[best];
++      mesa_logi("GPROF %6.1f ms/s %5llu jobs/s avg %6.2f ms draws/job %llu  %s",
++                k->ns / 1e6 / secs, (unsigned long long)(k->count / secs),
++                k->ns / 1e6 / k->count,
++                (unsigned long long)(k->draws / k->count), k->sig);
++      k->ns = 0;
++   }
++   for (unsigned i = 0; i < panvk_gprof_nkinds; i++)
++      panvk_gprof_kinds[i].ns = panvk_gprof_kinds[i].count =
++         panvk_gprof_kinds[i].draws = 0;
++   panvk_gprof_window = now;
++}
++
++static void
++panvk_gprof_done(unsigned atom)
++{
++   simple_mtx_lock(&panvk_gprof_lock);
++   const uint64_t now = os_time_get_nano();
++   const int k = panvk_gprof_kind_of[atom & 255];
++   if (k >= 0 && panvk_gprof_submit_ns[atom & 255]) {
++      uint64_t start = MAX2(panvk_gprof_submit_ns[atom & 255],
++                            panvk_gprof_last_done);
++      if (now > start)
++         panvk_gprof_kinds[k].ns += now - start;
++      panvk_gprof_kinds[k].count++;
++      panvk_gprof_kinds[k].draws += panvk_gprof_draws_of[atom & 255];
++      panvk_gprof_kind_of[atom & 255] = -1;
++   }
++   panvk_gprof_last_done = now;
++   if (!panvk_gprof_window)
++      panvk_gprof_window = now;
++   else if (now - panvk_gprof_window > 5000000000ull)
++      panvk_gprof_report_locked(now);
++   simple_mtx_unlock(&panvk_gprof_lock);
++}
++
++static void
++panvk_gprof_submit(uint64_t atom, const char *kind,
++                   const struct panvk_batch *batch)
++{
++   char sig[96];
++   snprintf(sig, sizeof(sig), "%s fb=%ux%u%s%s%s cs=%08x wg=%ux%ux%u l=%ux%u",
++            kind, batch->diag.fb_w, batch->diag.fb_h,
++            batch->diag.gs ? " gs" : "", batch->diag.tess ? " tess" : "",
++            batch->diag.xfb ? " xfb" : "",
++            batch->diag.dispatches ? batch->diag.cs_hash : 0,
++            batch->diag.wg[0], batch->diag.wg[1], batch->diag.wg[2],
++            batch->diag.local[0], batch->diag.local[1]);
++   simple_mtx_lock(&panvk_gprof_lock);
++   int k = -1;
++   for (unsigned i = 0; i < panvk_gprof_nkinds; i++)
++      if (!strcmp(panvk_gprof_kinds[i].sig, sig))
++         k = i;
++   if (k < 0 && panvk_gprof_nkinds < ARRAY_SIZE(panvk_gprof_kinds)) {
++      k = panvk_gprof_nkinds++;
++      snprintf(panvk_gprof_kinds[k].sig, sizeof(panvk_gprof_kinds[k].sig),
++               "%s", sig);
++   }
++   panvk_gprof_kind_of[atom & 255] = k;
++   panvk_gprof_submit_ns[atom & 255] = os_time_get_nano();
++   panvk_gprof_draws_of[atom & 255] = batch->diag.draws;
++   kbase_kmod_atom_done_cb = panvk_gprof_done;
++   simple_mtx_unlock(&panvk_gprof_lock);
++}
++
+ static void
+ panvk_diag_note_atom(uint64_t atom, const char *kind,
+                      const struct panvk_batch *batch)
+ {
+    if (!atom)
+       return;
++   if (panvk_gprof_on())
++      panvk_gprof_submit(atom, kind, batch);
+    kbase_kmod_atom_fail_cb = panvk_diag_atom_failed;
+    snprintf(panvk_diag_atoms[atom & 255], sizeof(panvk_diag_atoms[0]),
+             "%s fb=%ux%u draws=%u gs=%u tess=%u xfb=%u max_verts=%llu "
+-- 
+2.43.0
+

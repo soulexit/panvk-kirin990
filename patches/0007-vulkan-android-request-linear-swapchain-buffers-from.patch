@@ -1,0 +1,42 @@
+From c8cba869e45b45c57c4be6e2864a3e204134b0eb Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 05:41:04 +0300
+Subject: [PATCH] vulkan/android: request linear swapchain buffers from Huawei
+ gralloc
+
+---
+ src/vulkan/runtime/vk_android.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/vulkan/runtime/vk_android.c b/src/vulkan/runtime/vk_android.c
+index 97637ed..31795d4 100644
+--- a/src/vulkan/runtime/vk_android.c
++++ b/src/vulkan/runtime/vk_android.c
+@@ -456,6 +456,11 @@ setup_gralloc0_usage(VkFormat format, VkImageUsageFlags image_usage,
+    if (!gralloc_usage)
+       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+ 
++   /* Huawei/HiSilicon gralloc (Kirin, EMUI) gives GPU-rendered swapchain
++    * buffers AFBC with a vendor address scramble, which the kbase import path
++    * cannot use.  Asking for CPU access makes it allocate them linear. */
++   gralloc_usage |= GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN;
++
+    *out_gralloc_usage = gralloc_usage;
+ 
+    return VK_SUCCESS;
+@@ -662,6 +667,12 @@ vk_common_GetSwapchainGrallocUsage2ANDROID(
+    if (gralloc_usage & GRALLOC_USAGE_HW_TEXTURE)
+       *grallocConsumerUsage |= GRALLOC1_CONSUMER_USAGE_GPU_TEXTURE;
+ 
++   /* The CPU flags from setup_gralloc0_usage() in gralloc1 terms: the
++    * producer flags are what Huawei's allocator checks before using AFBC. */
++   *grallocConsumerUsage |= GRALLOC1_CONSUMER_USAGE_CPU_READ_OFTEN;
++   *grallocProducerUsage |= GRALLOC1_PRODUCER_USAGE_CPU_READ_OFTEN |
++                            GRALLOC1_PRODUCER_USAGE_CPU_WRITE_OFTEN;
++
+    /* for front buffer rendering */
+    if (swapchainImageUsage & VK_SWAPCHAIN_IMAGE_USAGE_SHARED_BIT_ANDROID)
+       *grallocProducerUsage |= vk_android_get_front_buffer_usage();
+-- 
+2.43.0
+

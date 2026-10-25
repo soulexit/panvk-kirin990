@@ -1,0 +1,73 @@
+From 1faec1c51f7b1ae1d5a9c52269d596634ba98150 Mon Sep 17 00:00:00 2001
+From: soulexit <b@l>
+Date: Sun, 25 Oct 2026 13:09:10 +0300
+Subject: [PATCH] panvk/kbase: measure sync-file export waits;
+ PANVK_JM_EXPORT_NOWAIT A/B
+
+---
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c |  9 +++++++--
+ src/panfrost/vulkan/panvk_physical_device.c | 19 +++++++++++++++++++
+ 2 files changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index ee01443..9465b29 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -205,8 +205,13 @@ panvk_gprof_report_locked(uint64_t now)
+    uint64_t total = 0;
+    for (unsigned i = 0; i < panvk_gprof_nkinds; i++)
+       total += panvk_gprof_kinds[i].ns;
+-   mesa_logi("GPROF window %.1fs: GPU busy %.0f ms/s over %u kinds", secs,
+-             total / 1e6 / secs, panvk_gprof_nkinds);
++   extern uint64_t panvk_kbase_export_wait_ns;
++   extern uint32_t panvk_kbase_export_count;
++   const uint64_t ew = p_atomic_xchg(&panvk_kbase_export_wait_ns, 0);
++   const uint32_t ec = p_atomic_xchg(&panvk_kbase_export_count, 0);
++   mesa_logi("GPROF window %.1fs: GPU busy %.0f ms/s over %u kinds; "
++             "sync-file export waits %.0f ms/s (%.0f/s)", secs,
++             total / 1e6 / secs, panvk_gprof_nkinds, ew / 1e6 / secs, ec / secs);
+    for (unsigned r = 0; r < 12; r++) {
+       int best = -1;
+       for (unsigned i = 0; i < panvk_gprof_nkinds; i++)
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index e358977..b5c36a6 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -1119,6 +1119,9 @@ out:
+    return VK_SUCCESS;
+ }
+ 
++uint64_t panvk_kbase_export_wait_ns;
++uint32_t panvk_kbase_export_count;
++
+ /* JM has no CQS fence export: wait for the payload on the CPU and hand out
+  * -1, which the Vulkan spec allows for an already-signaled SYNC_FD.  Without
+  * any export_sync_file the runtime drops SYNC_FD semaphores entirely, which
+@@ -1142,8 +1145,24 @@ kbase_cpu_sync_export_sync_file_jm(struct vk_device *device,
+    }
+    mtx_unlock(&ks->mutex);
+ 
++   /* A/B only: hand out "signaled" without waiting for the GPU.  The
++    * consumer may then read the image before it is finished. */
++   static int nowait = -1;
++   if (nowait < 0) {
++      const char *e = getenv("PANVK_JM_EXPORT_NOWAIT");
++      nowait = e && e[0] == '1';
++   }
++   if (nowait) {
++      p_atomic_inc(&panvk_kbase_export_count);
++      *sync_file = -1;
++      return VK_SUCCESS;
++   }
++
++   const uint64_t t0 = os_time_get_nano();
+    VkResult result =
+       kbase_cpu_sync_wait_one(device, ks, VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
++   p_atomic_add(&panvk_kbase_export_wait_ns, os_time_get_nano() - t0);
++   p_atomic_inc(&panvk_kbase_export_count);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-- 
+2.43.0
+

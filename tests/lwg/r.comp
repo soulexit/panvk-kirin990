@@ -1,0 +1,24 @@
+#version 450
+layout(local_size_x = 32, local_size_y = 30) in;
+layout(std430, binding = 0) readonly buffer In { uint data[]; };
+layout(std430, binding = 1) writeonly buffer Out { uint res[]; };
+shared uint s_min, s_max, s_sum;
+shared uint s_arr[960];
+void main() {
+  uint lid = gl_LocalInvocationIndex;
+  uint gidx = gl_WorkGroupID.x * 960u + lid;
+  uint v = data[gidx];
+  // value that lives across all barriers
+  uint mine = v * 3u + gl_LocalInvocationID.y;
+  if (lid == 0u) { s_min = 0xffffffffu; s_max = 0u; s_sum = 0u; }
+  s_arr[lid] = v;
+  barrier();
+  atomicMin(s_min, v); atomicMax(s_max, v); atomicAdd(s_sum, v);
+  uint acc = 0u;
+  for (uint i = 0u; i < 8u; i++) acc += s_arr[(lid + i * 37u) % 960u];
+  barrier();
+  // neighbour read after barrier (needs all writes of first region)
+  uint nb = s_arr[959u - lid];
+  barrier();
+  res[gidx] = mine + nb + acc + (lid == 0u ? (s_min ^ s_max ^ s_sum) : 0u);
+}
