@@ -1,0 +1,43 @@
+From b49734b531f44e40402419aa515c91ed9c308d30 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 08:21:19 +0300
+Subject: [PATCH 23/27] panvk: no VK_EXT_multisampled_render_to_single_sampled
+ on JM
+
+Every supported dEQP-VK multisampled_render_to_single_sampled case fails
+on Mali-G76 (colour attachments past the first and the depth resolve are
+wrong). DXVK and vkd3d-proton do not use it; keep it for CSF.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_vX_physical_device.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index 9a2e5ec..cb1ce4f 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -195,7 +195,10 @@ panvk_per_arch(get_physical_device_extensions)(
+       .EXT_pageable_device_local_memory = PAN_ARCH >= 10,
+       .EXT_non_seamless_cube_map = true,
+       .EXT_mutable_descriptor_type = true,
+-      .EXT_multisampled_render_to_single_sampled = true,
++      /* Fails every supported CTS case on Bifrost JM (Mali-G76: colour
++       * attachments past the first and depth resolve wrong); unused by
++       * DXVK/vkd3d-proton. */
++      .EXT_multisampled_render_to_single_sampled = PAN_ARCH >= 10,
+       .EXT_multi_draw = PAN_ARCH >= 10,
+       .EXT_physical_device_drm = true,
+       .EXT_pipeline_creation_cache_control = true,
+@@ -830,7 +833,7 @@ panvk_per_arch(get_physical_device_features)(
+ #endif
+ 
+       /* VK_EXT_multisampled_render_to_single_sampled */
+-      .multisampledRenderToSingleSampled = true,
++      .multisampledRenderToSingleSampled = PAN_ARCH >= 10,
+ 
+ #ifdef PANVK_USE_WSI_PLATFORM
+       /* VK_EXT_present_timing */
+-- 
+2.43.0
+

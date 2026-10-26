@@ -1,0 +1,39 @@
+From 9671ee1557ad1b2a475cbc66258324ab9430fb48 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 08:21:19 +0300
+Subject: [PATCH 25/27] panvk/jm: vertex shader images use an attribute buffer
+ index offset
+
+The descriptor copy job adds attrib_buf_idx_offset to the image's
+attribute buffer index, but the draw passed the vertex buffers' size in
+bytes. Vertex-stage storage images and texel buffers then pointed past
+the attribute buffer table and the vertex job hung (device lost in
+dEQP-VK.synchronization*.op.*read_image_vertex and others).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 3e7a914..910462f 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -1903,9 +1903,13 @@ panvk_draw_prepare_vs_copy_desc_job(struct panvk_cmd_buffer *cmdbuf,
+    unsigned num_vbs = util_last_bit(vi->bindings_valid);
+    struct pan_ptr ptr;
+ 
++   /* The copy shader adds this to the image's attribute buffer index: it is
++    * the number of vertex-buffer slots (two per binding), not a byte offset.
++    * A byte offset points the VS image attributes past the end of the
++    * attribute buffer table and hangs the vertex job. */
+    VkResult result = panvk_per_arch(meta_get_copy_desc_job)(
+       cmdbuf, vs_desc_info, &cmdbuf->state.gfx.desc_state, vs_desc_state,
+-      num_vbs * pan_size(ATTRIBUTE_BUFFER) * 2, &ptr);
++      num_vbs * 2, &ptr);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+-- 
+2.43.0
+

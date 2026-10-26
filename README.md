@@ -16,7 +16,7 @@ Companion repos: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kir
 
 ## At a glance
 
-| | Previous Kirin 990 Winlator pack | This driver (1.0.0-winlator) |
+| | Previous Kirin 990 Winlator pack | This driver (1.1.0-winlator) |
 |---|---|---|
 | D3D11 (AIO cube) | works | ~260–270 FPS |
 | D3D9 (AIO cube) | ~5 FPS | **~74 FPS** with the Performance emulator preset (see *Settings*) |
@@ -24,6 +24,7 @@ Companion repos: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kir
 | Geometry shaders / tessellation / transform feedback | advertised but not implemented (GPU hang) | implemented (emulated), tests pass |
 | VKD3D-Proton (D3D12) | no | feature level 11_0, shader model 6.5 |
 | NieR:Automata | GPU hang on the boot screen | reaches title screen and main menu (~20 FPS) |
+| Vulkan CTS (dEQP-VK 1.4.7.0) | – | 94 k cases pass in a 1/10 sample of the whole suite; API/info group 18 failures of 20 k (was 610). See [docs/CTS.md](docs/CTS.md) |
 
 ## Device
 
@@ -33,20 +34,29 @@ Companion repos: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kir
 | SoC / GPU | Kirin 990 / Mali-G76 MC16 (Bifrost, arch v7) |
 | Android | 10 (EMUI 12), API 29, kernel 4.14.116 |
 | Kernel GPU driver | stock `mali_kbase`, JM, uAPI 11.16 (56-byte atoms) |
-| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.0.0-winlator (Mesa 26.3.0-devel)`, Vulkan 1.3.363 |
+| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.1.0-winlator (Mesa 26.3.0-devel)`, Vulkan 1.3.363, 165 device extensions |
 
 Also checked on a Galaxy A51 (Exynos 9611, Mali-G72 MP3, AOSP 16, kbase uAPI 11.35):
 same build runs; all tests pass (see *Results*).
 
 ## Install
 
-1. Download `panvk-g76-kirin990-1.0.0-winlator.zip` from the
+1. Download `panvk-g76-kirin990-1.1.0-winlator.zip` from the
    [releases](https://github.com/soulexit/panvk-kirin990-winlator/releases).
 2. Winlator → **Contents** (or the AdrenoTools/driver manager) → install the zip
    (do not unzip it).
 3. In the container (or the game shortcut's settings), set the drivers as in *Settings*.
 
-Release `1.0.0-winlator` (pre-release):
+Release `1.1.0-winlator` (pre-release):
+
+```text
+zip:     panvk-g76-kirin990-1.1.0-winlator.zip
+sha256:  31769bbb30c6b8650baee8b3a95e2aeba35bbb2986fced5127691569043252a8
+.so:     3cdc670b832298bd0a1661d6efbd8c210ff7a1c514981f81fa74c2fa0f86fd13
+source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0027 (tree 2b001a2bfd)
+```
+
+Previous release `1.0.0-winlator`:
 
 ```text
 zip:     panvk-g76-kirin990-1.0.0-winlator.zip
@@ -64,7 +74,7 @@ These are the settings all results below were measured with (Winlator cmod 4.1).
 
 | Setting | Value | Why |
 |---|---|---|
-| **Graphics Driver** | `PanVK G76 Kirin 990 1.0.0-winlator` | the game renders with PanVK |
+| **Graphics Driver** | `PanVK G76 Kirin 990 1.1.0-winlator` | the game renders with PanVK |
 | **Renderer Driver** | **System** (the phone's own Mali driver) | Winlator's screen compositor faults on PanVK on the P40 → black screen. With System the game still renders on PanVK. |
 | **Box64 preset** (x86_64 containers) | **Performance** | COMPATIBILITY enables `BOX64_DYNAREC_STRONGMEM=1`: every emulated memory access gets a barrier. The AIO D3D9 test spent 99 % of its CPU time in one emulated byte-swizzle loop (profiled with `simpleperf`, PanVK was 0.17 %). Performance: D3D9 12 → 60 FPS (A51), 5.5 → ~74 FPS (P40). Use COMPATIBILITY only for a game that breaks. |
 | **FEXCore preset** (ARM64EC containers) | the fastest one / TSO off | same effect as STRONGMEM above |
@@ -82,7 +92,7 @@ empty for normal use.
 ### On-device driver tests (adb, no root)
 
 Each test dlopens the driver directly (`vk_icdGetInstanceProcAddr`), renders or
-computes, reads back and compares. P40 and A51, build 1.0.0-winlator:
+computes, reads back and compares. P40 and A51, build 1.0.0-winlator (1.1.0-winlator re-run on the P40: same results):
 
 | Group | Tests | P40 (G76) | A51 (G72) |
 |---|---|---|---|
@@ -131,6 +141,14 @@ requests linear buffers itself).
 | 0007 | Swapchain buffers from Huawei gralloc were AFBC (unusable) → request CPU-access usage so gralloc allocates them linear. |
 | 0010 | Samsung (A51, AOSP 16, HIDL mapper 2.x only): import buffers as linear when no mapper metadata exists. |
 | **0012** | **NieR:Automata hang:** a D3D11 compute shader with 32×30 = 960 invocations per workgroup; the G76 holds at most 384 → the barrier deadlocked and the kernel killed the job (`event=0x4`, DEVICE_LOST). New compiler pass: if all barriers are top-level, the workgroup runs as K copies per hardware invocation (960 → 5 × 192), regions between barriers are emitted once per logical invocation. |
+| 0019, 0020 | **HOST_COHERENT memory not coherent** when `memoryMapPlaced` is enabled (`VK_EXT_map_memory_placed`, what Wine WoW64 uses for 32-bit games): every host-visible allocation became an ION buffer allocated CPU-cached, and the G76 does not snoop CPU caches. Now write-combined for coherent memory; cached buffers use `DMA_BUF_IOCTL_SYNC` for flush/invalidate and are cleaned after the kernel's zero fill. Found by CTS: smoke 2/8 → 8/8. |
+| 0021 | Global priority LOW was refused (only MEDIUM accepted). |
+| 0022 | `VK_KHR_maintenance7` update-after-bind dynamic-buffer totals were 0 on Bifrost. |
+| 0023 | `VK_EXT_multisampled_render_to_single_sampled` not advertised on JM: every supported CTS case failed; DXVK/VKD3D-Proton don't use it. |
+| 0024 | DRM-modifier image creation crashed (NULL modifier handler) when the application's modifier list was AFBC-only and the device had `customBorderColorWithoutFormat` on. |
+| 0025 | **GPU hang with images in vertex shaders**: the descriptor copy job got a byte offset where it adds a buffer index; the vertex job read past its attribute table. Also present in upstream Mesa. |
+| 0026 | Null image descriptors: size/level/sample queries returned 1 instead of 0; format-less storage-image loads returned non-zero. |
+| 0027 | Debugging knobs used for the CTS work (`PANVK_NO_LWG`, `PANVK_TRACE_JC`, `PANVK_IMPORT_LOG`). |
 | 0005, 0006, 0008, 0009, 0011, 0013–0018 | Diagnostics (off unless enabled in `panvk_env.txt`): swapchain pixel check, extension hiding, failed-job batch description, GPU-time profiler, wait/latency statistics. |
 
 Not in this series but required for Winlator: Android-only WSI (`-Dplatforms=android`).
@@ -155,7 +173,13 @@ swapchain and every DXVK version fails at `vkAcquireNextImageKHR`.
    `drm-shim` (`PAN_GPU_ID=7211` = G76), ASan and `NIR_DEBUG=validate`; new compiler
    code is proven there first. On the phone new code runs under `ulimit -v`, because
    an early bug in the workgroup pass exhausted memory and kernel-panicked the P40.
-6. **Rooted second phone (A51).** `simpleperf` on the Winlator game process (found the
+6. **Khronos Vulkan CTS (dEQP-VK 1.4.7.0)** built as a plain Android executable and run
+   over adb against the driver `.so` through a small loader shim (no root, no APK):
+   the whole API/info group, a 1/10 sample of every other group (286 k cases), every
+   failure re-run on its own, and the fixes checked against a 19 k-case sample of
+   previously passing tests for regressions. Method, numbers and remaining failures:
+   [docs/CTS.md](docs/CTS.md). `scripts/build-cts.sh`, `scripts/run-cts.sh`.
+7. **Rooted second phone (A51).** `simpleperf` on the Winlator game process (found the
    D3D9 bottleneck in emulated code, not the driver) and the kernel log.
 
 ## Known issues / next steps
@@ -167,6 +191,12 @@ swapchain and every DXVK version fails at `vkAcquireNextImageKHR`.
   helper before its vertex job (~0.25 ms per draw). Huawei's governor also keeps the
   G76 at 208–509 MHz instead of 600 MHz (not changeable without root).
 - No sparse resources → VKD3D-Proton FL 12_0 titles don't start.
+- Open CTS failures (details in [docs/CTS.md](docs/CTS.md)): GPU hangs in tessellation
+  with storage images in the evaluation shader and in some adjacency-primitive draws
+  (geometry/tessellation emulation); update-after-bind descriptors with storage images;
+  per-sample shading with several render targets plus depth resolve; texture offsets
+  with MIRRORED_REPEAT (Bifrost hardware, also failing upstream); Huawei AFBC
+  hardware buffers can't be imported (Winlator's are linear, not affected).
 
 Full investigation log: [docs/FINDINGS.md](docs/FINDINGS.md).
 
@@ -192,10 +222,13 @@ Failed GPU jobs are always logged (`panvk: failed atom N ran: …`).
 ```bash
 export ANDROID_NDK_ROOT=/path/to/android-ndk-r30
 scripts/prepare-tree.sh work          # Mesa 5a07217f + zenithblue series + patches/
-scripts/build-android.sh work 1.0.0-winlator   # → work/dist/panvk-g76-kirin990-1.0.0-winlator.zip
+scripts/build-android.sh work 1.1.0-winlator   # → work/dist/panvk-g76-kirin990-1.1.0-winlator.zip
 scripts/build-tests.sh work           # → out/tests, out/probes
 scripts/deploy-tests.sh work/dist/libvulkan_panfrost.so
 adb shell sh /data/local/tmp/run-tests.sh /data/local/tmp/drv
+scripts/build-cts.sh work             # optional: dEQP-VK for Android, → work/cts-dist
+adb push work/cts-dist/. /data/local/tmp/cts/
+scripts/run-cts.sh work/dist/libvulkan_panfrost.so caselist.txt results/
 ```
 
 Host requirements: meson, ninja, python3 (mako, pyyaml), LLVM + clang + libclc +

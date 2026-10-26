@@ -1,0 +1,63 @@
+From a0fa29e28a79a9b07f787a2ec819905b436838d2 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 08:21:19 +0300
+Subject: [PATCH 24/27] panvk: keep AFBC for images with application-chosen
+ modifiers
+
+The v7 customBorderColorWithoutFormat rule dropped AFBC for R/B-swapped
+formats even for VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT images, whose
+modifiers the format queries had advertised: no listed modifier was left
+and image creation dereferenced a NULL modifier handler
+(dEQP-VK.drm_format_modifiers.*). Apply the rule to optimal tiling only,
+and fail image creation cleanly if no modifier handler exists.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_image.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/vulkan/panvk_image.c b/src/panfrost/vulkan/panvk_image.c
+index d6b4fcf..152d02b 100644
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -218,7 +218,9 @@ panvk_image_can_use_mod(struct panvk_image *image,
+        */
+       const VkImageUsageFlags cbc_sampled =
+          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+-      if (arch == 7 &&
++      /* Images with application-chosen modifiers keep AFBC: the format
++       * queries advertised it without knowing the device's features. */
++      if (arch == 7 && image->vk.tiling == VK_IMAGE_TILING_OPTIMAL &&
+           image->vk.base.device->enabled_features
+              .customBorderColorWithoutFormat &&
+           ((image->vk.usage & cbc_sampled) || !panvk_v7_cbc_afbc())) {
+@@ -359,6 +361,13 @@ panvk_image_get_mod_from_list(struct panvk_image *image,
+ 
+    /* If we reached that point without finding a proper modifier, there's
+     * a serious issue. */
++   mesa_loge("panvk: no usable modifier: fmt %d %ux%ux%u usage 0x%x flags 0x%x "
++             "bind 0x%x host_copy %d, %u listed (first 0x%" PRIx64 ")",
++             image->vk.format, image->vk.extent.width, image->vk.extent.height,
++             image->vk.extent.depth, (unsigned)image->vk.usage,
++             (unsigned)image->vk.create_flags,
++             iusage->bind, iusage->host_copy, mod_count,
++             mod_count ? mods[0] : 0);
+    assert(!"Invalid modifier");
+    return DRM_FORMAT_MOD_INVALID;
+ }
+@@ -600,6 +609,12 @@ panvk_image_init_layouts(struct panvk_image *image,
+ 
+    const struct pan_mod_handler *mod_handler =
+       pan_mod_get_handler(arch, image->vk.drm_format_mod);
++   if (!mod_handler) {
++      mesa_loge("panvk: no layout handler for modifier 0x%" PRIx64
++                " (format %d)", image->vk.drm_format_mod, image->vk.format);
++      return panvk_error(image->vk.base.device,
++                         VK_ERROR_INITIALIZATION_FAILED);
++   }
+    const bool should_checksum =
+       arch >= 10 && panvk_should_checksum(image, pCreateInfo);
+    image->crc_safe_external = should_checksum && wsi_info != NULL;
+-- 
+2.43.0
+

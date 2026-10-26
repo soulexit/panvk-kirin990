@@ -1,0 +1,38 @@
+From de419338c66731da3f885851ceba51473f6be01d Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 08:21:07 +0300
+Subject: [PATCH 19/27] panvk/kbase: map HOST_COHERENT dma-heap BOs
+ write-combined
+
+With memoryMapPlaced (VK_EXT_map_memory_placed, used by Wine WoW64 for
+32-bit games) every host-visible allocation is an ION/dma-heap buffer.
+They were always allocated ION_FLAG_CACHED, so on a GPU that does not
+snoop the CPU caches (Kirin 990 / Mali-G76) HOST_COHERENT memory was not
+coherent: dEQP-VK.api.smoke and ~600 api tests read stale data. Only the
+HOST_CACHED (WB_MMAP) type gets a cached buffer now.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/lib/kmod/kbase_kmod.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 117a537..4d06a7c 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -2616,7 +2616,11 @@ kbase_kmod_bo_alloc_dmabuf(struct pan_kmod_dev *dev, uint64_t size,
+       struct kbase_ion_alloc ia = {
+          .len = alloc.len,
+          .heap_id_mask = kbase_dev->ion_heap_mask,
+-         .flags = 1, /* ION_FLAG_CACHED */
++         /* ION_FLAG_CACHED only for WB_MMAP (HOST_CACHED, explicit
++          * flush/invalidate).  Without it ION maps the buffer write-combined,
++          * which is what HOST_COHERENT needs on a GPU that does not snoop
++          * the CPU caches (Kirin 990: placed maps read stale lines). */
++         .flags = (kmod_flags & PAN_KMOD_BO_FLAG_WB_MMAP) ? 1 : 0,
+       };
+       if (ioctl(kbase_dev->dma_heap_fd, KBASE_ION_IOC_ALLOC, &ia)) {
+          mesa_loge("kbase: ION_IOC_ALLOC failed: %s", strerror(errno));
+-- 
+2.43.0
+

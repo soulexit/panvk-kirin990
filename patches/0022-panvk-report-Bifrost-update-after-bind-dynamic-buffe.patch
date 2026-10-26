@@ -1,0 +1,40 @@
+From db089d61094d4c63b2f75c34f77e9b23242e57fc Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 08:21:19 +0300
+Subject: [PATCH 22/27] panvk: report Bifrost update-after-bind dynamic buffer
+ totals
+
+The per-set update-after-bind dynamic buffer limits are advertised on
+v6/v7, so the VK_KHR_maintenance7 totals must not be 0 there
+(dEQP-VK.api.maintenance7.total_dynamic_buffers_properties).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_vX_physical_device.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_physical_device.c b/src/panfrost/vulkan/panvk_vX_physical_device.c
+index f749afa..9a2e5ec 100644
+--- a/src/panfrost/vulkan/panvk_vX_physical_device.c
++++ b/src/panfrost/vulkan/panvk_vX_physical_device.c
+@@ -1342,12 +1342,14 @@ panvk_per_arch(get_physical_device_properties)(
+       .maxDescriptorSetTotalUniformBuffersDynamic = MAX_DYNAMIC_UNIFORM_BUFFERS,
+       .maxDescriptorSetTotalStorageBuffersDynamic = MAX_DYNAMIC_STORAGE_BUFFERS,
+       .maxDescriptorSetTotalBuffersDynamic = MAX_DYNAMIC_BUFFERS,
++      /* Bifrost advertises update-after-bind dynamic buffers too (see
++       * maxDescriptorSetUpdateAfterBind*BuffersDynamic). */
+       .maxDescriptorSetUpdateAfterBindTotalUniformBuffersDynamic =
+-         PAN_ARCH >= 9 ? MAX_DYNAMIC_UNIFORM_BUFFERS : 0,
++         MAX_DYNAMIC_UNIFORM_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindTotalStorageBuffersDynamic =
+-         PAN_ARCH >= 9 ? MAX_DYNAMIC_STORAGE_BUFFERS : 0,
++         MAX_DYNAMIC_STORAGE_BUFFERS,
+       .maxDescriptorSetUpdateAfterBindTotalBuffersDynamic =
+-         PAN_ARCH >= 9 ? MAX_DYNAMIC_BUFFERS : 0,
++         MAX_DYNAMIC_BUFFERS,
+ 
+       /* VK_KHR_maintenance9 */
+       /* Sparse binding not supported yet. */
+-- 
+2.43.0
+

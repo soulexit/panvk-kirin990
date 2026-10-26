@@ -1,0 +1,170 @@
+From b0b66a84d5fcfb2d18b51c5c45e67c6011c51680 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 08:21:28 +0300
+Subject: [PATCH 26/27] panvk/v7: null image descriptors report zero sizes and
+ read zero
+
+Bifrost null descriptors are a 1x1 image made to read zero (texture:
+0000 swizzle, storage image: 0000 component order), so size, level and
+sample queries reported that image instead of 0, and format-less storage
+image loads (which convert in the shader) returned it or the
+out-of-bounds alpha. Recognise the null descriptors by those fields.
+dEQP-VK.robustness.robustness2 null_descriptor: 0 -> 117 of 129 sampled
+cases passing (texel buffer and cube size queries remain).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../vulkan/panvk_vX_nir_lower_descriptors.c   | 72 +++++++++++++++----
+ src/panfrost/vulkan/panvk_vX_shader.c         | 18 +++++
+ 2 files changed, 75 insertions(+), 15 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_nir_lower_descriptors.c b/src/panfrost/vulkan/panvk_vX_nir_lower_descriptors.c
+index 64b7169..635b415 100644
+--- a/src/panfrost/vulkan/panvk_vX_nir_lower_descriptors.c
++++ b/src/panfrost/vulkan/panvk_vX_nir_lower_descriptors.c
+@@ -611,6 +611,56 @@ load_resource_deref_desc(nir_builder *b, nir_deref_instr *deref,
+ }
+ 
+ #if PAN_ARCH < 9
++/* Bifrost null descriptors (panvk_device::null_descs) are a 1x1 image made
++ * to read zero: the texture has a 0000 swizzle and the storage image a 0000
++ * component order.  Queries must report 0 instead of that image, so
++ * recognise them by those fields: no real view has a 0000 swizzle that the
++ * application then queries, and no storage image format has that order.
++ */
++#define PANVK_NULL_TEX_SWIZZLE 0x924 /* ZERO in all four components */
++
++static nir_def *
++is_null_tex(nir_builder *b, nir_deref_instr *deref,
++            const struct lower_desc_ctx *ctx)
++{
++   if (!ctx->null_descriptor_support)
++      return NULL;
++   nir_def *w2 = load_resource_deref_desc(
++      b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8, 1, 32, ctx);
++   return nir_ieq_imm(b, nir_iand_imm(b, w2, 0xfff), PANVK_NULL_TEX_SWIZZLE);
++}
++
++#if PAN_ARCH == 6
++#define PANVK_NULL_ZERO_ORDER                                                  \
++   (MALI_CHANNEL_0 | (MALI_CHANNEL_0 << 3) | (MALI_CHANNEL_0 << 6) |          \
++    (MALI_CHANNEL_0 << 9))
++#else
++#define PANVK_NULL_ZERO_ORDER MALI_RGB_COMPONENT_ORDER_0000
++#endif
++
++/* Storage images keep the format above the 10-bit stride/log2(samples)
++ * field of word 2; the null one has the 0000 component order (see
++ * panvk_init_null_descs()). */
++static nir_def *
++is_null_img(nir_builder *b, nir_deref_instr *deref,
++            const struct lower_desc_ctx *ctx)
++{
++   if (!ctx->null_descriptor_support)
++      return NULL;
++   nir_def *w = load_resource_deref_desc(
++      b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8, 1, 32, ctx);
++   return nir_ieq_imm(b, nir_iand_imm(b, nir_ushr_imm(b, w, 10), 0xfff),
++                      PANVK_NULL_ZERO_ORDER);
++}
++
++static nir_def *
++zero_if(nir_builder *b, nir_def *cond, nir_def *val)
++{
++   return cond ? nir_bcsel(b, cond, nir_imm_zero(b, val->num_components,
++                                                 val->bit_size), val)
++               : val;
++}
++
+ static nir_def *
+ load_tex_size(nir_builder *b, nir_deref_instr *deref, enum glsl_sampler_dim dim,
+               bool is_array, const struct lower_desc_ctx *ctx)
+@@ -643,9 +693,8 @@ load_tex_size(nir_builder *b, nir_deref_instr *deref, enum glsl_sampler_dim dim,
+       loaded_size = nir_iadd_imm(b, nir_u2u32(b, tex_sz), 1);
+    }
+ 
+-   /* Bifrost null descriptors are a 1x1 image (panvk_device::null_descs),
+-    * so a query through one reports that image, not zero.
+-    */
++   if (dim != GLSL_SAMPLER_DIM_BUF)
++      loaded_size = zero_if(b, is_null_tex(b, deref, ctx), loaded_size);
+ 
+    return loaded_size;
+ }
+@@ -698,7 +747,7 @@ load_img_size(nir_builder *b, nir_deref_instr *deref, enum glsl_sampler_dim dim,
+          z_val = nir_ushr(b, z_val, sample_count);
+          tex_sz = nir_vector_insert_imm(b, tex_sz, z_val, 2);
+       }
+-      return tex_sz;
++      return zero_if(b, is_null_img(b, deref, ctx), tex_sz);
+    }
+ }
+ 
+@@ -714,11 +763,7 @@ load_tex_levels(nir_builder *b, nir_deref_instr *deref,
+    nir_def *lod_count = nir_iand_imm(b, nir_ushr_imm(b, tex_word2, 16), 0x1f);
+    nir_def *loaded_levels = nir_iadd_imm(b, lod_count, 1);
+ 
+-   /* Bifrost null descriptors are a 1x1 image (panvk_device::null_descs),
+-    * so a query through one reports that image, not zero.
+-    */
+-
+-   return loaded_levels;
++   return zero_if(b, is_null_tex(b, deref, ctx), loaded_levels);
+ }
+ 
+ static nir_def *
+@@ -733,11 +778,7 @@ load_tex_samples(nir_builder *b, nir_deref_instr *deref,
+    nir_def *sample_count = nir_iand_imm(b, nir_ushr_imm(b, tex_word3, 13), 0x7);
+    nir_def *loaded_samples = nir_ishl(b, nir_imm_int(b, 1), sample_count);
+ 
+-   /* Bifrost null descriptors are a 1x1 image (panvk_device::null_descs),
+-    * so a query through one reports that image, not zero.
+-    */
+-
+-   return loaded_samples;
++   return zero_if(b, is_null_tex(b, deref, ctx), loaded_samples);
+ }
+ 
+ static nir_def *
+@@ -758,7 +799,8 @@ load_img_samples(nir_builder *b, nir_deref_instr *deref,
+ 
+    sample_count = nir_iand_imm(b, nir_ushr_imm(b, sample_count, 7),
+                                BITFIELD_MASK(3));
+-   return nir_ishl(b, one, sample_count);
++   return zero_if(b, is_null_img(b, deref, ctx),
++                  nir_ishl(b, one, sample_count));
+ }
+ 
+ /* Bindless descriptors on v6/v7 (jm-v7 050), see panvk_binding_is_bindless().
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index b46e159..b12c32c 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -3275,6 +3275,24 @@ panvk_v7_lower_robust_image2_intr(nir_builder *b, nir_intrinsic_instr *intr,
+       }
+       nir_def *res = nir_vector_insert_imm(
+          b, &intr->def, nir_bcsel(b, in_bounds, hw_a, oob_a), 3);
++      if (format == PIPE_FORMAT_NONE) {
++         /* A null descriptor (0000 component order, panvk_init_null_descs())
++          * reads (0, 0, 0, 0), not the out-of-bounds alpha. */
++#if PAN_ARCH == 6
++         const uint32_t zero_order = MALI_CHANNEL_0 | (MALI_CHANNEL_0 << 3) |
++                                     (MALI_CHANNEL_0 << 6) |
++                                     (MALI_CHANNEL_0 << 9);
++#else
++         const uint32_t zero_order = MALI_RGB_COMPONENT_ORDER_0000;
++#endif
++         nir_def *fmt = nir_image_deref_format(b, 32, intr->src[0].ssa,
++                                               .image_dim = dim,
++                                               .image_array = array);
++         nir_def *is_null =
++            nir_ieq_imm(b, nir_iand_imm(b, fmt, 0xfff), zero_order);
++         res = nir_bcsel(b, is_null,
++                         nir_imm_zero(b, res->num_components, bit_size), res);
++      }
+       nir_def_rewrite_uses_after(&intr->def, res);
+       return true;
+    }
+-- 
+2.43.0
+

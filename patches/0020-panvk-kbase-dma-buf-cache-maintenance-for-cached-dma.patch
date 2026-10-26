@@ -1,0 +1,64 @@
+From 52bcf51fd9df28a7af424a3aa95b01dbe0e76c77 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 08:21:07 +0300
+Subject: [PATCH 20/27] panvk/kbase: dma-buf cache maintenance for cached
+ dma-heap BOs
+
+Cached dma-heap/ION BOs are CPU mapped through the dma-buf, which
+KBASE_IOCTL_MEM_SYNC does not cover: flush/invalidate them with
+DMA_BUF_IOCTL_SYNC (WRITE cleans, READ invalidates), and clean a new
+buffer once so the heap's zero fill reaches memory. Fixes
+dEQP-VK.memory.zero_initialize_device_memory on the HOST_CACHED type.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/lib/kmod/kbase_kmod.c | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 4d06a7c..beb29e6 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -2634,6 +2634,15 @@ kbase_kmod_bo_alloc_dmabuf(struct pan_kmod_dev *dev, uint64_t size,
+ 
+    struct pan_kmod_bo *bo = kbase_kmod_import_dmabuf(
+       dev, NULL, alloc.fd, alloc.len, kmod_flags, false);
++
++   /* The heap zeroed a cached buffer through the CPU cache: clean it so the
++    * GPU sees zeroes (and VK_EXT_zero_initialize_device_memory holds). */
++   if (bo && (kmod_flags & PAN_KMOD_BO_FLAG_WB_MMAP)) {
++      struct dma_buf_sync dsync = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE };
++      ioctl(alloc.fd, DMA_BUF_IOCTL_SYNC, &dsync);
++      dsync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
++      ioctl(alloc.fd, DMA_BUF_IOCTL_SYNC, &dsync);
++   }
+    close(alloc.fd);
+    return bo;
+ }
+@@ -3055,6 +3064,23 @@ kbase_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
+       if (kbase_bo->cpu_gpu_coherent)
+          continue;
+ 
++      /* dma-buf backed BOs (ION/dma-heap, e.g. for placed maps) are CPU
++       * mapped through the dma-buf, which MEM_SYNC does not know about: use
++       * the dma-buf cache maintenance.  WRITE cleans, READ invalidates; a
++       * flush must not invalidate, it would drop dirty lines. */
++      if (kbase_bo->dmabuf_fd >= 0) {
++         const uint64_t dir = flush ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ;
++         struct dma_buf_sync dsync = { DMA_BUF_SYNC_START | dir };
++         int dret = ioctl(kbase_bo->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &dsync);
++         dsync.flags = DMA_BUF_SYNC_END | dir;
++         dret |= ioctl(kbase_bo->dmabuf_fd, DMA_BUF_IOCTL_SYNC, &dsync);
++         if (dret) {
++            mesa_loge("kbase: DMA_BUF_IOCTL_SYNC failed: %s", strerror(errno));
++            return -1;
++         }
++         continue;
++      }
++
+       struct kbase_ioctl_mem_sync req = {
+          .handle = kbase_bo->gpu_va,
+          .user_addr = (uintptr_t)kbase_bo->cpu_ptr + sync->start,
+-- 
+2.43.0
+

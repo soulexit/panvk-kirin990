@@ -1,0 +1,179 @@
+diff --git a/external/vulkancts/modules/vulkan/memory/vktMemoryMapPlacedTests.cpp b/external/vulkancts/modules/vulkan/memory/vktMemoryMapPlacedTests.cpp
+index 2b3b9e3..fabb405 100644
+--- a/external/vulkancts/modules/vulkan/memory/vktMemoryMapPlacedTests.cpp
++++ b/external/vulkancts/modules/vulkan/memory/vktMemoryMapPlacedTests.cpp
+@@ -62,6 +62,8 @@
+ #include <unistd.h>
+ #include <fcntl.h>
+ #include <errno.h>
++#include <sys/syscall.h>
++#include <linux/memfd.h>
+ #endif
+ 
+ using namespace vk;
+@@ -168,7 +170,7 @@ public:
+         const size_t guardSize = alignment;
+         const size_t fileSize  = guardSize + alignment + alignedMemorySize + guardSize;
+ 
+-        int memfd = memfd_create("mapplaced-test", MFD_CLOEXEC);
++        int memfd = (int)syscall(__NR_memfd_create, "mapplaced-test", MFD_CLOEXEC);
+         if (memfd < 0)
+             TCU_THROW(NotSupportedError, "memfd_create failed");
+ 
+diff --git a/external/vulkancts/modules/vulkan/vktTestCase.cpp b/external/vulkancts/modules/vulkan/vktTestCase.cpp
+index 95672e4..a964358 100644
+--- a/external/vulkancts/modules/vulkan/vktTestCase.cpp
++++ b/external/vulkancts/modules/vulkan/vktTestCase.cpp
+@@ -24,6 +24,8 @@
+  *//*--------------------------------------------------------------------*/
+ 
+ #include "vktTestCase.hpp"
++#include <cstdlib>
++#include <cstdio>
+ #include "vktCustomInstancesDevices.hpp"
+ 
+ #include "vkRef.hpp"
+@@ -396,6 +398,39 @@ Move<VkDevice> createDefaultDevice(const PlatformInterface &vkp, VkInstance inst
+     deviceInfo.enabledExtensionCount   = de::sizeU32(usedExtensions);
+     deviceInfo.ppEnabledExtensionNames = de::dataOrNull(usedExtensions);
+     deviceInfo.pEnabledFeatures        = enabledFeatures.pNext ? nullptr : &enabledFeatures.features;
++    // local debugging aid (panvk-kirin990): strip the feature chain / extensions
++    if (getenv("CTS_DBG_NOCHAIN"))
++    {
++        deviceInfo.pNext            = nullptr;
++        deviceInfo.pEnabledFeatures = &enabledFeatures.features;
++    }
++    if (const char *keep = getenv("CTS_DBG_KEEP"))
++    {
++        // keep only feature structs [lo, hi) of the chain; print their sTypes
++        int lo = 0, hi = 1 << 30;
++        sscanf(keep, "%d-%d", &lo, &hi);
++        VkBaseOutStructure *head = (VkBaseOutStructure *)&enabledFeatures;
++        VkBaseOutStructure *last = head;
++        VkBaseOutStructure *cur  = head->pNext;
++        for (int i = 0; cur; i++)
++        {
++            VkBaseOutStructure *next = cur->pNext;
++            if (i >= lo && i < hi)
++            {
++                fprintf(stderr, "CTS_DBG keep %d sType %d\n", i, (int)cur->sType);
++                last->pNext = cur;
++                last        = cur;
++            }
++            cur = next;
++        }
++        last->pNext = nullptr;
++    }
++    if (getenv("CTS_DBG_NOEXT"))
++        deviceInfo.enabledExtensionCount = 0;
++    if (getenv("CTS_DBG_NOCORE"))
++        const_cast<VkPhysicalDeviceFeatures2 &>(enabledFeatures).features = VkPhysicalDeviceFeatures{};
++    if (getenv("CTS_DBG_ONEQ"))
++        deviceInfo.queueCreateInfoCount = 1;
+ 
+ #ifdef CTS_USES_VULKANSC
+     // devices created for Vulkan SC must have VkDeviceObjectReservationCreateInfo structure defined in VkDeviceCreateInfo::pNext chain
+diff --git a/framework/platform/CMakeLists.txt b/framework/platform/CMakeLists.txt
+index 8f6e0c5..1483d71 100644
+--- a/framework/platform/CMakeLists.txt
++++ b/framework/platform/CMakeLists.txt
+@@ -136,6 +136,9 @@ if (NOT DEFINED TCUTIL_PLATFORM_SRCS)
+ 			android/tcuAndroidExecService.cpp
+ 			android/tcuAndroidExecService.hpp
+ 			)
++		if (DEQP_ANDROID_EXE)
++			set(TCUTIL_PLATFORM_SRCS ${TCUTIL_PLATFORM_SRCS} android/tcuAndroidExePlatform.cpp)
++		endif ()
+ 
+ 		if (DE_ANDROID_API GREATER 8)
+ 			# Add NativeActivity code
+diff --git a/framework/platform/android/tcuAndroidExePlatform.cpp b/framework/platform/android/tcuAndroidExePlatform.cpp
+new file mode 100644
+index 0000000..c252244
+--- /dev/null
++++ b/framework/platform/android/tcuAndroidExePlatform.cpp
+@@ -0,0 +1,84 @@
++/* Headless Vulkan-only platform for DEQP_ANDROID_EXE builds (no WSI). */
++#include "tcuPlatform.hpp"
++#include "tcuFunctionLibrary.hpp"
++#include "vkPlatform.hpp"
++#include "vkWsiPlatform.hpp"
++#include "deMemory.h"
++#include <sys/utsname.h>
++
++namespace tcu
++{
++namespace androidexe
++{
++
++class VulkanLibrary : public vk::Library
++{
++public:
++    VulkanLibrary(const char *libraryPath)
++        : m_library(libraryPath != nullptr ? libraryPath : "libvulkan.so")
++        , m_driver(m_library)
++    {
++    }
++    const vk::PlatformInterface &getPlatformInterface(void) const
++    {
++        return m_driver;
++    }
++    const tcu::FunctionLibrary &getFunctionLibrary(void) const
++    {
++        return m_library;
++    }
++
++private:
++    const DynamicFunctionLibrary m_library;
++    const vk::PlatformDriver m_driver;
++};
++
++class VulkanPlatform : public vk::Platform
++{
++public:
++    vk::wsi::Display *createWsiDisplay(vk::wsi::Type) const
++    {
++        TCU_THROW(NotSupportedError, "WSI type not supported");
++    }
++    bool hasDisplay(vk::wsi::Type) const
++    {
++        return false;
++    }
++    vk::Library *createLibrary(LibraryType libraryType, const char *libraryPath) const
++    {
++        if (libraryType != LIBRARY_TYPE_VULKAN)
++            TCU_THROW(InternalError, "Unknown library type requested");
++        return new VulkanLibrary(libraryPath);
++    }
++    vk::Library *createLibrary(const char *libraryPath) const
++    {
++        return new VulkanLibrary(libraryPath);
++    }
++    void describePlatform(std::ostream &dst) const
++    {
++        utsname u;
++        deMemset(&u, 0, sizeof(u));
++        uname(&u);
++        dst << "OS: " << u.sysname << " " << u.release << " " << u.version << "\nCPU: " << u.machine << "\n";
++    }
++};
++
++class Platform : public tcu::Platform
++{
++public:
++    const vk::Platform &getVulkanPlatform(void) const
++    {
++        return m_vk;
++    }
++
++private:
++    VulkanPlatform m_vk;
++};
++
++} // namespace androidexe
++} // namespace tcu
++
++tcu::Platform *createPlatform(void)
++{
++    return new tcu::androidexe::Platform();
++}

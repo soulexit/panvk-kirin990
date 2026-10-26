@@ -1,0 +1,55 @@
+From c0fa73434d21513600f77246ad296ff055397578 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 08:21:07 +0300
+Subject: [PATCH 21/27] panvk/jm: accept LOW global priority
+
+LOW only ever needs to be a hint: report and accept it (it runs as
+MEDIUM). Refusing it failed dEQP-VK.api.device_init.create_device_global_priority*.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_physical_device.c | 7 ++++---
+ src/panfrost/vulkan/panvk_vX_device.c       | 5 +++--
+ 2 files changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index e589b21..52d2744 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -1620,11 +1620,12 @@ panvk_fill_global_priority(const struct panvk_physical_device *physical_device,
+          physical_device->kmod.dev->props.allowed_group_priorities_mask;
+ 
+       /* Non-medium priority context is not hooked-up in the JM backend, even
+-       * though the panfrost kmod advertize it. Manually filter non-medium
+-       * priority for now.
++       * though the panfrost kmod advertize it. LOW is accepted and runs as
++       * MEDIUM (a priority is a hint); HIGH/REALTIME are filtered out.
+        */
+       if (arch < 10)
+-         prio_mask &= PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM;
++         prio_mask &= PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW |
++                      PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM;
+ 
+       if (prio_mask & PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW)
+          prio->priorities[prio_idx++] = VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR;
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index 8f67ec8..4c15eff 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -342,10 +342,11 @@ check_global_priority(const struct panvk_physical_device *phys_dev,
+ 
+       /* Non-medium priority context is not hooked-up in the JM backend, even
+        * though the panfrost kmod advertize it. Manually filter non-medium
+-       * priority for now.
++       * priority for now; LOW runs as MEDIUM (see panvk_fill_global_priority).
+        */
+       if (arch < 10)
+-         allowed_prio_mask &= PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM;
++         allowed_prio_mask &= PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW |
++                              PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM;
+ 
+       if (requested_prio & allowed_prio_mask)
+          return VK_SUCCESS;
+-- 
+2.43.0
+
