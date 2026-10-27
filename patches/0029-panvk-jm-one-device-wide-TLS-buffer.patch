@@ -1,0 +1,166 @@
+From 229070edd9cfe96bf295e9435841f21b152c4fb8 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 13:52:33 +0300
+Subject: [PATCH 29/36] panvk/jm: one device-wide TLS buffer
+
+Every JM command buffer allocated its own stack buffer (one per heap
+half), sized for all GPU threads. NieR:Automata's 960-thread compute
+shader needs 1.9 KiB per thread, and the per-command-buffer copies held
+300-640 MiB until Android killed the game. Port the CSF device TLS: the
+device keeps the largest buffer, batches running at the same time use
+different thread slots of it, command buffers hold references so an
+outgrown buffer is freed once nothing pending uses it. cmd_tls+dev_tls
+in NieR: 640 -> ~60 MiB. PANVK_JM_DEV_TLS=0 restores the old buffers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_cmd_buffer.h    |  3 +
+ src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c | 83 +++++++++++++++++++-
+ 2 files changed, 85 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+index e0ee48e..af2169e 100644
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -126,6 +126,9 @@ struct panvk_cmd_buffer {
+       uint64_t tls_ptr, wls_ptr;
+       uint64_t tls_size, wls_size;
+    } tls_half[2];
++   /* Device-wide TLS BOs this command buffer's batches use (see
++    * get_device_tls() in panvk_vX_cmd_buffer.c). */
++   struct util_dynarray dev_tls_refs;
+    struct list_head batches;
+    struct list_head push_sets;
+    struct panvk_batch *cur_batch;
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index 3792412..a2afb92 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -28,6 +28,7 @@
+ #include "panvk_meta.h"
+ #include "panvk_physical_device.h"
+ #include "panvk_priv_bo.h"
++#include "util/u_debug.h"
+ 
+ #include "pan_desc.h"
+ #include "pan_encoder.h"
+@@ -92,6 +93,80 @@ panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
+ 
+ static void cmd_close_batch_impl(struct panvk_cmd_buffer *cmdbuf);
+ 
++
++/* Device-wide TLS (ported from the CSF backend, csf-v11 097/227). A batch's
++ * stack is addressed by shader core and hardware thread slot, so batches
++ * running at the same time never share a slot and can use one buffer: the
++ * device keeps the largest one and every batch uses it. Per command buffer
++ * (jm-v7 107 kept one per half) NieR:Automata held 300-640 MiB of TLS, its
++ * 960-thread compute shader needing 1.9 KiB per thread, and Android killed
++ * the game. Each command buffer references the BOs its batches use, so an
++ * outgrown BO is freed once no command buffer that used it can be pending.
++ * PANVK_JM_DEV_TLS=0 restores the per-command-buffer buffers. */
++static bool
++jm_dev_tls_on(void)
++{
++   static int v = -1;
++   if (p_atomic_read(&v) < 0)
++      p_atomic_set(&v, debug_get_bool_option("PANVK_JM_DEV_TLS", true));
++   return p_atomic_read(&v);
++}
++
++static void
++dev_tls_release(struct panvk_cmd_buffer *cmdbuf)
++{
++   util_dynarray_foreach(&cmdbuf->dev_tls_refs, struct panvk_priv_bo *, bo)
++      panvk_priv_bo_unref(*bo);
++   util_dynarray_clear(&cmdbuf->dev_tls_refs);
++}
++
++static uint64_t
++get_device_tls(struct panvk_cmd_buffer *cmdbuf, uint64_t size)
++{
++   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
++   uint64_t addr = 0;
++
++   simple_mtx_lock(&dev->tls.lock);
++   struct panvk_priv_bo *cur =
++      util_dynarray_num_elements(&dev->tls.bos, struct panvk_priv_bo *)
++         ? util_dynarray_top(&dev->tls.bos, struct panvk_priv_bo *)
++         : NULL;
++
++   if (!cur || pan_kmod_bo_size(cur->bo) < size) {
++      struct panvk_priv_bo *bo;
++      if (panvk_priv_bo_create_kind(
++             dev, size,
++             panvk_device_adjust_bo_flags(dev, PAN_KMOD_BO_FLAG_NO_MMAP),
++             VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &bo,
++             PANVK_MEM_DEV_TLS) == VK_SUCCESS) {
++         /* Command buffers that use the outgrown BOs hold their own
++          * references. */
++         util_dynarray_foreach(&dev->tls.bos, struct panvk_priv_bo *, old) {
++            p_atomic_add(&panvk_mem_stats.dev_tls_freed_B,
++                         pan_kmod_bo_size((*old)->bo));
++            panvk_priv_bo_unref(*old);
++         }
++         util_dynarray_clear(&dev->tls.bos);
++         util_dynarray_append(&dev->tls.bos, bo);
++         cur = bo;
++      } else {
++         cur = NULL;
++      }
++   }
++
++   if (cur) {
++      addr = cur->addr.dev;
++      bool held = false;
++      util_dynarray_foreach(&cmdbuf->dev_tls_refs, struct panvk_priv_bo *, r)
++         held = held || *r == cur;
++      if (!held)
++         util_dynarray_append(&cmdbuf->dev_tls_refs, panvk_priv_bo_ref(cur));
++   }
++   simple_mtx_unlock(&dev->tls.lock);
++
++   return addr;
++}
++
+ void
+ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
+ {
+@@ -184,7 +259,9 @@ cmd_close_batch_impl(struct panvk_cmd_buffer *cmdbuf)
+                                                thread_tls_alloc, core_id_range);
+       /* jm-v7 107: reuse this half's buffer when it is large enough. */
+       const unsigned h = batch->heap_half & 1;
+-      if (panvk_v7_tls_share() && cmdbuf->tls_half[h].tls_ptr &&
++      if (jm_dev_tls_on()) {
++         batch->tlsinfo.tls.ptr = get_device_tls(cmdbuf, size);
++      } else if (panvk_v7_tls_share() && cmdbuf->tls_half[h].tls_ptr &&
+           cmdbuf->tls_half[h].tls_size >= size) {
+          batch->tlsinfo.tls.ptr = cmdbuf->tls_half[h].tls_ptr;
+       } else {
+@@ -589,6 +666,7 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
+    panvk_pool_reset(&cmdbuf->desc_pool);
+    panvk_pool_reset(&cmdbuf->tls_pool);
+    memset(cmdbuf->tls_half, 0, sizeof(cmdbuf->tls_half));
++   dev_tls_release(cmdbuf);
+    panvk_pool_reset(&cmdbuf->varying_pool);
+    panvk_pool_reset(&cmdbuf->gs_pool);
+    panvk_cmd_buffer_obj_list_reset(cmdbuf, push_sets);
+@@ -621,6 +699,8 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
+ 
+    panvk_pool_cleanup(&cmdbuf->desc_pool);
+    panvk_pool_cleanup(&cmdbuf->tls_pool);
++   dev_tls_release(cmdbuf);
++   util_dynarray_fini(&cmdbuf->dev_tls_refs);
+    panvk_pool_cleanup(&cmdbuf->varying_pool);
+    panvk_pool_cleanup(&cmdbuf->gs_pool);
+    panvk_cmd_buffer_obj_list_cleanup(cmdbuf, push_sets);
+@@ -682,6 +762,7 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
+       .owns_bos = true,
+       .needs_locking = false,
+    };
++   util_dynarray_init(&cmdbuf->dev_tls_refs, NULL);
+    panvk_pool_init(&cmdbuf->tls_pool, device, &pool->tls_bo_pool, &pool->tls_big_bo_pool,
+                    &tls_pool_props);
+ 
+-- 
+2.43.0
+

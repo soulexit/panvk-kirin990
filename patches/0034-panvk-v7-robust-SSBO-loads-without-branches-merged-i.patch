@@ -1,0 +1,429 @@
+From f0c626c15e24c9429798d1e54d85b601f9bcfba7 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Tue, 27 Oct 2026 03:53:34 +0300
+Subject: [PATCH 34/36] panvk/v7: robust SSBO loads without branches, merged
+ into 16-byte loads
+
+With robustBufferAccess2 (DXVK), every storage buffer load on v6/v7 was
+lowered to an if-guarded 32-bit load, alone in its clause. NieR:Automata's
+skinning vertex shaders do 30-80 of them per vertex: Mali-G76 counters
+showed 0.04 instructions per cycle and the tiler waiting on position
+shading most of the frame.
+
+- has_load_global_bounded: nir_lower_explicit_io emits load_global_bounded
+  and panvk lowers it to straight-line code (out of bounds: read offset 0,
+  return 0). Keeps the load's alignment, up to the 16 bytes storage buffer
+  descriptors guarantee.
+- panvk_vectorize_bounded_loads: 32-bit bounded loads of one buffer at
+  x * mul + c (x provably 16-byte aligned, c in one 16-byte chunk) become
+  one 128-bit load; each member keeps its own bounds check, so robustness
+  stays exact per component. The offset is split through iadd/imul/ishl by
+  constants recursively, as the pass runs before constant folding.
+
+NieR:Automata: 1,880 of 2,003 bounded loads merged into 522; the large
+vertex/tiler batches went from 188/110 ms to 117/72 ms, draws/s from
+~1,000 to ~1,450.
+
+PANVK_V7_BRANCHY_SSBO=1 and PANVK_V7_NO_SSBO_VEC=1 turn the two parts off;
+PANVK_SSBO_VEC_LOG=1 / PANVK_SSBO_VEC_DUMP=1 log the merge per shader.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_vX_shader.c | 355 ++++++++++++++++++++++++++
+ 1 file changed, 355 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 4935eb5..d430afa 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -20,6 +20,7 @@
+ #include "panvk_physical_device.h"
+ #include "panvk_sampler.h"
+ #include "panvk_shader.h"
++#include "c11/threads.h"
+ #include "panvk_v7_knobs.h"
+ #if PAN_ARCH >= 9
+ #include "panvk_gpu_prerast.h"
+@@ -44,6 +45,7 @@
+ #include "util/u_hexdump.h"
+ #include "util/u_memory.h"
+ #include "nir_builder.h"
++#include "nir_range_analysis.h"
+ #include "nir_builtin_builder.h"
+ #include "nir_conversion_builder.h"
+ #include "nir_deref.h"
+@@ -446,11 +448,359 @@ panvk_buffer_ssbo_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
+    }
+ }
+ 
++#if PAN_ARCH < 9
++/* Robust SSBO loads on v6/v7 (64bit_bounded_global): with
++ * has_load_global_bounded, nir_lower_explicit_io emits load_global_bounded
++ * instead of wrapping every load in an if, and panvk_lower_bounded_loads()
++ * turns it into straight-line code. PANVK_V7_BRANCHY_SSBO=1 restores the
++ * if-guarded loads. */
++static bool
++panvk_v7_branchless_ssbo(void)
++{
++   static int v = -1;
++   if (v < 0) {
++      const char *e = getenv("PANVK_V7_BRANCHY_SSBO");
++      v = !(e && e[0] == '1');
++   }
++   return v;
++}
++
++/* A guarded load sits alone in its clause behind a branch, so a shader
++ * reading a structured buffer waits for each 32-bit load before issuing the
++ * next. NieR:Automata's skinning vertex shaders do ~30 of them per vertex:
++ * the shader cores ran at 0.04 instructions per cycle and the tiler waited
++ * on position shading most of the frame (Mali-G76 hardware counters).
++ * Out of bounds the load reads offset 0 of the buffer instead (buffer
++ * memory is page-sized; a null SSBO is the zero page) and the result is
++ * replaced by 0, which is what robustBufferAccess2 requires. */
++static bool
++panvk_lower_bounded_load(nir_builder *b, nir_intrinsic_instr *intr,
++                         UNUSED void *data)
++{
++   if (intr->intrinsic != nir_intrinsic_load_global_bounded)
++      return false;
++
++   b->cursor = nir_before_instr(&intr->instr);
++   const unsigned comps = intr->def.num_components;
++   const unsigned bit_size = intr->def.bit_size;
++   const unsigned size = comps * bit_size / 8;
++   nir_def *base = intr->src[0].ssa;
++   nir_def *offset = intr->src[1].ssa;
++   nir_def *bound = intr->src[2].ssa;
++
++   nir_def *fits = nir_iand(b, nir_uge_imm(b, bound, size),
++                            nir_uge(b, nir_iadd_imm(b, bound, -size), offset));
++   nir_def *safe_offset = nir_bcsel(b, fits, offset, nir_imm_int(b, 0));
++   nir_def *addr = nir_iadd(b, base, nir_u2u64(b, safe_offset));
++   /* Offset 0 keeps the load's alignment; storage buffer descriptors are
++    * 16-byte aligned, so up to 16 of it holds for the address too (else a
++    * vec4 load would be split into four 32-bit loads). */
++   const unsigned align = nir_intrinsic_align_offset(intr)
++                             ? bit_size / 8
++                             : MIN2(nir_intrinsic_align_mul(intr), 16);
++   nir_def *val = nir_load_global(
++      b, comps, bit_size, addr, .align_mul = MAX2(align, bit_size / 8),
++      .align_offset = 0, .access = nir_intrinsic_access(intr));
++   nir_def_replace(&intr->def,
++                   nir_bcsel(b, fits, val, nir_imm_zero(b, comps, bit_size)));
++   return true;
++}
++
++/* Merging bounded loads into 16-byte loads.
++ *
++ * DXVK reads structured buffers as uint arrays, so a float4 member becomes
++ * four bounded 32-bit loads at offset X + 0/4/8/12. On Bifrost each one is
++ * its own LOAD.i32 (the backend only issues wide global loads at their
++ * natural alignment). When X is provably a multiple of 16 the four can be one
++ * LOAD.i128 at base + X: storage buffer descriptors are 16-byte aligned
++ * (minStorageBufferOffsetAlignment, 64-byte buffer alignment), so the 16
++ * bytes stay inside the 16-byte block holding the first byte, which is in
++ * bounds whenever any member is. Each member keeps its own bounds check, so
++ * robustBufferAccess2 is still exact per 32-bit component.
++ * PANVK_V7_NO_SSBO_VEC=1 disables it. */
++struct panvk_bl_cand {
++   nir_intrinsic_instr *intr;
++   nir_scalar base[2], bound, x;
++   uint32_t mul, chunk;
++   unsigned lane;
++   int group;
++};
++
++/* Write the offset as x * mul + c (mod 2^32), looking through additions,
++ * shifts and multiplications by constants: DXVK addresses raw/structured
++ * buffers in dwords, so a byte offset is (index + k) << 2 until constant
++ * folding and nir_opt_algebraic, which run after this pass, distribute it
++ * (and the descriptor's offset is still an unfolded iadd(0, 0)). x is NULL
++ * when the whole offset is constant. */
++static nir_scalar
++panvk_bl_split_const(nir_scalar s, uint32_t *mul, uint32_t *c, unsigned depth)
++{
++   *mul = 1;
++   *c = 0;
++   s = nir_scalar_chase_movs(s);
++   if (nir_scalar_is_const(s)) {
++      *c = nir_scalar_as_uint(s);
++      return (nir_scalar){NULL, 0};
++   }
++   if (!nir_scalar_is_alu(s) || depth > 8)
++      return s;
++
++   const nir_op op = nir_scalar_alu_op(s);
++   nir_scalar a = nir_scalar_chase_alu_src(s, 0);
++   nir_scalar b = nir_scalar_chase_alu_src(s, 1);
++   if (op == nir_op_iadd) {
++      uint32_t ma, ca, mb, cb;
++      nir_scalar xa = panvk_bl_split_const(a, &ma, &ca, depth + 1);
++      nir_scalar xb = panvk_bl_split_const(b, &mb, &cb, depth + 1);
++      if (xa.def && xb.def)
++         return s;
++      *mul = xa.def ? ma : mb;
++      *c = ca + cb;
++      return xa.def ? xa : xb;
++   }
++   if (op == nir_op_imul || op == nir_op_ishl) {
++      if (op == nir_op_imul && nir_scalar_is_const(a)) {
++         nir_scalar t = a;
++         a = b;
++         b = t;
++      }
++      if (!nir_scalar_is_const(b))
++         return s;
++      const uint32_t k = op == nir_op_ishl ? 1u << (nir_scalar_as_uint(b) & 31)
++                                           : (uint32_t)nir_scalar_as_uint(b);
++      uint32_t ma, ca;
++      nir_scalar xa = panvk_bl_split_const(a, &ma, &ca, depth + 1);
++      *mul = ma * k;
++      *c = ca * k;
++      return *mul ? xa : (nir_scalar){NULL, 0};
++   }
++   return s;
++}
++
++static void
++panvk_bl_dump(nir_scalar s, int depth, char *buf, size_t len)
++{
++   size_t n = strlen(buf);
++   s = nir_scalar_chase_movs(s);
++   if (nir_scalar_is_const(s)) {
++      snprintf(buf + n, len - n, "%u", (unsigned)nir_scalar_as_uint(s));
++   } else if (nir_scalar_is_alu(s) && depth < 5) {
++      const nir_op op = nir_scalar_alu_op(s);
++      snprintf(buf + n, len - n, "%s(", nir_op_infos[op].name);
++      for (unsigned i = 0; i < nir_op_infos[op].num_inputs; i++) {
++         if (i)
++            strncat(buf, ",", len - strlen(buf) - 1);
++         panvk_bl_dump(nir_scalar_chase_alu_src(s, i), depth + 1, buf, len);
++      }
++      strncat(buf, ")", len - strlen(buf) - 1);
++   } else {
++      snprintf(buf + n, len - n, "%%%u.%u", s.def->index, s.comp);
++   }
++}
++
++static bool
++panvk_bl_scalar_eq(nir_scalar a, nir_scalar b)
++{
++   return a.def == b.def && a.comp == b.comp;
++}
++
++static bool
++panvk_bl_same_group(const struct panvk_bl_cand *a, const struct panvk_bl_cand *b)
++{
++   return panvk_bl_scalar_eq(a->base[0], b->base[0]) &&
++          panvk_bl_scalar_eq(a->base[1], b->base[1]) &&
++          panvk_bl_scalar_eq(a->bound, b->bound) &&
++          panvk_bl_scalar_eq(a->x, b->x) && a->mul == b->mul &&
++          a->chunk == b->chunk;
++}
++
++static bool
++panvk_bl_candidate(nir_intrinsic_instr *intr, struct hash_table *lsb_ht,
++                   struct panvk_bl_cand *c, unsigned *stats)
++{
++   if (intr->intrinsic != nir_intrinsic_load_global_bounded)
++      return false;
++   stats[0]++;
++   if (intr->def.bit_size != 32 ||
++       !(nir_intrinsic_access(intr) & ACCESS_CAN_REORDER)) {
++      stats[1]++;
++      return false;
++   }
++
++   uint32_t mul, off;
++   nir_scalar x =
++      panvk_bl_split_const(nir_get_scalar(intr->src[1].ssa, 0), &mul, &off, 0);
++   if (off % 4 || (off % 16) + intr->def.num_components * 4 > 16) {
++      stats[2]++;
++      return false;
++   }
++   if (x.def && nir_def_num_lsb_zero(lsb_ht, x) + ffs(mul) - 1 < 4) {
++      if (getenv("PANVK_SSBO_VEC_DUMP")) {
++         char buf[512] = "";
++         panvk_bl_dump(nir_get_scalar(intr->src[1].ssa, 0), 0, buf, sizeof(buf));
++         mesa_logi("ssbovec align-rejected offset: %s", buf);
++      }
++      stats[3]++;
++      return false;
++   }
++
++   nir_scalar base = nir_scalar_chase_movs(nir_get_scalar(intr->src[0].ssa, 0));
++   if (nir_scalar_is_alu(base) && nir_scalar_alu_op(base) == nir_op_pack_64_2x32) {
++      nir_alu_instr *pack = nir_def_as_alu(base.def);
++      for (unsigned i = 0; i < 2; i++)
++         c->base[i] = nir_scalar_chase_movs(
++            nir_get_scalar(pack->src[0].src.ssa, pack->src[0].swizzle[i]));
++   } else {
++      c->base[0] = base;
++      c->base[1] = (nir_scalar){NULL, 0};
++   }
++   c->intr = intr;
++   c->bound = nir_scalar_chase_movs(nir_get_scalar(intr->src[2].ssa, 0));
++   c->x = x;
++   c->mul = mul;
++   c->chunk = off & ~15u;
++   c->lane = (off % 16) / 4;
++   c->group = -1;
++   return true;
++}
++
++static bool
++panvk_vectorize_bounded_loads(nir_shader *nir)
++{
++   static int enabled = -1;
++   if (enabled < 0) {
++      const char *e = getenv("PANVK_V7_NO_SSBO_VEC");
++      enabled = !(e && e[0] == '1');
++   }
++   if (!enabled)
++      return false;
++
++   /* PANVK_SSBO_VEC_LOG=1: per shader, bounded loads seen / rejected
++    * (type or access, constant offset, alignment) / merged into groups. */
++   static int log = -1;
++   if (log < 0) {
++      const char *e = getenv("PANVK_SSBO_VEC_LOG");
++      log = e && e[0] == '1' ? 300 : 0;
++   }
++   unsigned stats[6] = {0};
++
++   bool progress = false;
++   struct hash_table *lsb_ht = _mesa_pointer_hash_table_create(NULL);
++   struct util_dynarray cands;
++   util_dynarray_init(&cands, NULL);
++
++   nir_foreach_function_impl(impl, nir) {
++      nir_builder b = nir_builder_create(impl);
++      bool impl_progress = false;
++
++      nir_foreach_block(block, impl) {
++         /* The rewrites below free instructions: drop cached analysis. */
++         _mesa_hash_table_clear(lsb_ht, NULL);
++         util_dynarray_clear(&cands);
++         nir_foreach_instr(instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            struct panvk_bl_cand c;
++            if (panvk_bl_candidate(nir_instr_as_intrinsic(instr), lsb_ht, &c, stats))
++               util_dynarray_append(&cands, c);
++         }
++
++         struct panvk_bl_cand *cs = util_dynarray_begin(&cands);
++         const unsigned n = util_dynarray_num_elements(&cands, struct panvk_bl_cand);
++         for (unsigned i = 0; i < n; i++) {
++            if (cs[i].group >= 0)
++               continue;
++            unsigned members = 1;
++            for (unsigned j = i + 1; j < n; j++) {
++               if (cs[j].group < 0 && panvk_bl_same_group(&cs[i], &cs[j])) {
++                  cs[j].group = i;
++                  members++;
++               }
++            }
++            if (members < 2)
++               continue;
++            cs[i].group = i;
++
++            /* One 16-byte load in front of the first member. */
++            nir_intrinsic_instr *first = cs[i].intr;
++            b.cursor = nir_before_instr(&first->instr);
++            nir_def *bound = first->src[2].ssa;
++            nir_def *x = nir_imm_int(&b, cs[i].chunk);
++            if (cs[i].x.def)
++               x = nir_iadd(&b, nir_imul_imm(&b, nir_mov_scalar(&b, cs[i].x), cs[i].mul), x);
++            nir_def *any_fits = nir_iand(&b, nir_uge_imm(&b, bound, 4),
++                                         nir_uge(&b, nir_iadd_imm(&b, bound, -4), x));
++            nir_def *addr = nir_iadd(&b, first->src[0].ssa,
++                                     nir_u2u64(&b, nir_bcsel(&b, any_fits, x,
++                                                             nir_imm_int(&b, 0))));
++            nir_def *vec = nir_load_global(&b, 4, 32, addr, .align_mul = 16,
++                                           .align_offset = 0,
++                                           .access = nir_intrinsic_access(first));
++
++            for (unsigned j = i; j < n; j++) {
++               if (cs[j].group != (int)i)
++                  continue;
++               nir_intrinsic_instr *intr = cs[j].intr;
++               const unsigned comps = intr->def.num_components;
++               b.cursor = nir_before_instr(&intr->instr);
++               nir_def *offset = intr->src[1].ssa;
++               nir_def *mbound = intr->src[2].ssa;
++               nir_def *fits = nir_iand(&b, nir_uge_imm(&b, mbound, comps * 4),
++                                        nir_uge(&b, nir_iadd_imm(&b, mbound, -(int)(comps * 4)),
++                                                offset));
++               /* any_fits: the vector was read at x (false only if an
++                * offset wrapped around 2^32 back into the buffer). */
++               fits = nir_iand(&b, fits, any_fits);
++               nir_def *val = nir_channels(&b, vec, BITFIELD_RANGE(cs[j].lane, comps));
++               nir_def_replace(&intr->def,
++                               nir_bcsel(&b, fits, val, nir_imm_zero(&b, comps, 32)));
++            }
++            stats[4]++;
++            stats[5] += members;
++            impl_progress = true;
++         }
++      }
++
++      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
++   }
++
++   if (log > 0 && stats[0]) {
++      log--;
++      mesa_logi("ssbovec(a33) %s: %u bounded loads, rejected %u type/access %u "
++                "offset %u align, merged %u into %u loads",
++                mesa_shader_stage_name(nir->info.stage), stats[0], stats[1],
++                stats[2], stats[3], stats[5], stats[4]);
++   }
++   util_dynarray_fini(&cands);
++   _mesa_hash_table_destroy(lsb_ht, NULL);
++   return progress;
++}
++
++static nir_shader_compiler_options panvk_v7_nir_options[MESA_SHADER_STAGES];
++static once_flag panvk_v7_nir_options_once = ONCE_FLAG_INIT;
++
++static void
++panvk_v7_init_nir_options(void)
++{
++   for (unsigned s = 0; s < MESA_SHADER_STAGES; s++) {
++      panvk_v7_nir_options[s] =
++         *pan_get_nir_shader_compiler_options(PAN_ARCH, s, false);
++      panvk_v7_nir_options[s].has_load_global_bounded = true;
++   }
++}
++#endif
++
+ static const nir_shader_compiler_options *
+ panvk_get_nir_options(UNUSED struct vk_physical_device *vk_pdev,
+                       mesa_shader_stage stage,
+                       UNUSED const struct vk_pipeline_robustness_state *rs)
+ {
++#if PAN_ARCH < 9
++   if (panvk_v7_branchless_ssbo()) {
++      call_once(&panvk_v7_nir_options_once, panvk_v7_init_nir_options);
++      return &panvk_v7_nir_options[stage];
++   }
++#endif
+    return pan_get_nir_shader_compiler_options(PAN_ARCH, stage, false);
+ }
+ 
+@@ -3617,6 +3967,11 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
+             panvk_buffer_ubo_addr_format(rs->uniform_buffers));
+    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
+             panvk_buffer_ssbo_addr_format(panvk_ssbo_robustness(rs)));
++#if PAN_ARCH < 9
++   NIR_PASS(_, nir, panvk_vectorize_bounded_loads);
++   NIR_PASS(_, nir, nir_shader_intrinsics_pass, panvk_lower_bounded_load,
++            nir_metadata_control_flow, NULL);
++#endif
+    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
+             nir_address_format_32bit_offset);
+    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
+-- 
+2.43.0
+

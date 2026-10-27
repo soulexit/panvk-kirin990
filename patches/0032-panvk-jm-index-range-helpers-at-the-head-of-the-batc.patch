@@ -1,0 +1,247 @@
+From 92e47afea253591ab0f29eac4d4ccbc381eac05f Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 13:52:44 +0300
+Subject: [PATCH 32/36] panvk/jm: index range helpers at the head of the batch
+
+The index range helpers of indexed draws patch their draw's IDVS, vertex
+and tiler descriptors, so each ran with SUPPRESS_PREFETCH and the job
+manager stalled on every indexed draw until its helper finished: ~0.47 ms
+of GPU time per draw on the Mali-G76, most of a NieR:Automata frame. A
+render pass cannot change the index or indirect buffers its draws read,
+so the helpers (WRITE_VALUE, min/max search, draw helper) go to a
+separate list that is moved to the head of the batch's job chain at
+close, followed by one NULL job with barrier and SUPPRESS_PREFETCH: one
+stall per batch, the helpers run in parallel (the varying allocation is
+an atomic add). Not for vertex shaders that write memory, the
+geometry/tessellation emulation, layered draws or helpers depending on
+an earlier job. 200 indexed draws of 3000 indices: 41 -> 16 ms per frame.
+PANVK_V7_HOIST=0 keeps the helpers in place. The GPU profile also counts
+indexed draws.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_cmd_buffer.h     | 11 ++++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c  | 65 +++++++++++++++++++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c    | 35 +++++++++-
+ src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c |  6 ++
+ 4 files changed, 114 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+index af2169e..bab88ea 100644
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -31,6 +31,11 @@
+ 
+ #include "genxml/gen_macros.h"
+ 
++struct panvk_batch;
++unsigned panvk_per_arch(jc_add_hoisted)(struct panvk_batch *batch, unsigned type,
++                              unsigned local_dep, unsigned global_dep,
++                              const struct pan_ptr *job);
++
+ struct panvk_batch {
+    struct list_head node;
+    struct util_dynarray jobs;
+@@ -47,6 +52,12 @@ struct panvk_batch {
+    bool after_frag;
+    struct util_dynarray event_ops;
+    struct pan_jc vtc_jc;
++   /* Jobs moved to the head of vtc_jc when the batch is closed (index range
++    * helpers of indexed draws, see panvk_jc_add_hoisted()). Only first_job
++    * and prev_job are used; job indices come from vtc_jc. */
++   struct pan_jc hoist_jc;
++   /* Set while recording jobs that go to hoist_jc. */
++   bool hoisting;
+    struct pan_jc frag_jc;
+    struct {
+       struct pan_ptr desc;
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index a2afb92..d5e4c0f 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -207,6 +207,69 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
+    cmd_close_batch_impl(cmdbuf);
+ }
+ 
++
++/* Hoisted jobs (jm-v7 batch helpers): the index range helpers of indexed
++ * draws patch their draw's IDVS/vertex/tiler descriptors, so each one ran
++ * with SUPPRESS_PREFETCH and the job manager stalled on every indexed draw
++ * until the helper had finished (~0.47 ms of GPU time per draw on the G76,
++ * most of NieR:Automata's frame). The helpers of a render pass only read the
++ * index and indirect buffers, which cannot change inside the pass, so they
++ * go to a separate list that is moved to the head of the batch's chain when
++ * the batch is closed, followed by one NULL job with barrier and
++ * SUPPRESS_PREFETCH: one stall per batch, and the helpers run in parallel.
++ * Indices come from vtc_jc, so dependencies on them stay valid. */
++unsigned
++panvk_per_arch(jc_add_hoisted)(struct panvk_batch *batch, unsigned type,
++                     unsigned local_dep, unsigned global_dep,
++                     const struct pan_ptr *job)
++{
++   struct pan_jc *jc = &batch->hoist_jc;
++   const unsigned index = ++batch->vtc_jc.job_index;
++
++   pan_cast_and_pack(job->cpu, JOB_HEADER, header) {
++      header.type = type;
++      header.index = index;
++      header.dependency_1 = local_dep;
++      header.dependency_2 = global_dep;
++   }
++
++   if (jc->prev_job) {
++      jc->prev_job->opaque[6] = job->gpu;
++      jc->prev_job->opaque[7] = job->gpu >> 32;
++   } else {
++      jc->first_job = job->gpu;
++   }
++   jc->prev_job = (struct mali_job_header_packed *)job->cpu;
++   return index;
++}
++
++static void
++splice_hoisted_jobs(struct panvk_cmd_buffer *cmdbuf, struct panvk_batch *batch)
++{
++   if (!batch->hoist_jc.first_job || !batch->vtc_jc.first_job)
++      return;
++
++   struct pan_ptr sep = panvk_cmd_alloc_desc(cmdbuf, JOB_HEADER);
++   if (!sep.gpu)
++      return;
++   util_dynarray_append(&batch->jobs, sep.cpu);
++
++   const unsigned index = ++batch->vtc_jc.job_index;
++   pan_cast_and_pack(sep.cpu, JOB_HEADER, header) {
++      header.type = MALI_JOB_TYPE_NULL;
++      header.barrier = true;
++      header.suppress_prefetch = true;
++      header.index = index;
++      header.next = batch->vtc_jc.first_job;
++   }
++
++   struct mali_job_header_packed *last = batch->hoist_jc.prev_job;
++   last->opaque[6] = sep.gpu;
++   last->opaque[7] = sep.gpu >> 32;
++   batch->vtc_jc.first_job = batch->hoist_jc.first_job;
++   batch->hoist_jc = (struct pan_jc){0};
++}
++
+ static void
+ cmd_close_batch_impl(struct panvk_cmd_buffer *cmdbuf)
+ {
+@@ -217,6 +280,8 @@ cmd_close_batch_impl(struct panvk_cmd_buffer *cmdbuf)
+ 
+    assert(batch);
+ 
++   splice_hoisted_jobs(cmdbuf, batch);
++
+    if (!batch->fb.desc.gpu && !batch->vtc_jc.first_job) {
+       if (util_dynarray_num_elements(&batch->event_ops,
+                                      struct panvk_cmd_event_op) == 0) {
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 910462f..9d22523 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -3344,7 +3344,24 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+                             draw->cpu_count <= PANVK_V7_MINMAX_FOLD_MAX &&
+                             !vs->info.writes_global;
+ 
++   /* Index range helpers recorded to the head of the batch (see
++    * panvk_jc_add_hoisted()). Not when the vertex shader writes memory (its
++    * vs_ref jobs need the range in order), with the geometry/tessellation
++    * emulation, multiview/layered draws, or when the helper waits for an
++    * earlier job of the batch. PANVK_V7_HOIST=0 keeps them in place. */
++   static int hoist_knob = -1;
++   if (hoist_knob < 0) {
++      const char *e = getenv("PANVK_V7_HOIST");
++      hoist_knob = !(e && e[0] == '0');
++   }
++   const bool hoist = hoist_knob && draw->info.index.index_size &&
++                      !vs->info.writes_global && !draw->indirect_dep_job &&
++                      !draw->tess_phase && !draw->gs_varying_bufs &&
++                      enabled_layer_count == 1;
++
+    if (draw->info.index.index_size) {
++      p_atomic_inc(&panvk_mem_stats.draws_indexed);
++      p_atomic_add(&panvk_mem_stats.draw_indices, draw->cpu_count);
+       struct pan_ptr res = panvk_cmd_alloc_dev_mem(
+          cmdbuf, desc, sizeof(struct libpan_draw_helper_index_min_max_result),
+          8);
+@@ -3379,7 +3396,7 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+          .nthreads = wg_count * 64,
+       };
+ 
+-      unsigned search_dep = copy_desc_job_id;
++      unsigned search_dep = hoist ? 0 : copy_desc_job_id;
+       if (!single_wg) {
+          struct libpan_draw_helper_index_min_max_result val = {
+             .min = ((uint64_t)1 << (draw->info.index.index_size * 8)) - 1,
+@@ -3397,16 +3414,24 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+          };
+ 
+          search_dep =
+-            pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_WRITE_VALUE, false,
+-                           false, 0, copy_desc_job_id, &write_job, false);
++            hoist ? panvk_per_arch(jc_add_hoisted)(
++                       batch, MALI_JOB_TYPE_WRITE_VALUE, 0, 0, &write_job)
++                  : pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_WRITE_VALUE,
++                                   false, false, 0, copy_desc_job_id,
++                                   &write_job, false);
+          util_dynarray_append(&batch->jobs, write_job.cpu);
+       }
+ 
++      batch->hoisting = hoist;
+       panlib_draw_index_minmax_search_helper_struct(
+          &precomp_ctx, panlib_1d_with_jm_deps(wg_count, 0, search_dep),
+          PANLIB_BARRIER_NONE, args, util_logbase2(draw->info.index.index_size),
+          draw->info.index.restart_enable, single_wg);
++      batch->hoisting = false;
+       job_before_indirect_helper = batch->vtc_jc.job_index;
++   } else if (hoist) {
++      /* Folded search: the helper is the first job of the draw's range. */
++      job_before_indirect_helper = 0;
+    }
+ 
+    /* vertexPipelineStoresAndAtomics (jm-v7 046): the vertex job shades the
+@@ -3533,8 +3558,10 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+             .tiler_job = draw->gs_varying_bufs ? 0 : draw->jobs.tiler.gpu,
+             .primitive_restart = draw->info.index.restart_enable,
+          };
++         batch->hoisting = hoist;
+          panlib_draw_indexed_indirect_minmax_helper_struct(
+             &precomp_ctx, indirect_grid, indirect_barrier, args);
++         batch->hoisting = false;
+       } else if (draw->info.indirect.buffer_dev_addr != 0 &&
+                  draw->info.index.index_size) {
+          const struct panlib_draw_indexed_indirect_helper_args args = {
+@@ -3562,8 +3589,10 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+              */
+             .tiler_job = draw->gs_varying_bufs ? 0 : draw->jobs.tiler.gpu,
+          };
++         batch->hoisting = hoist;
+          panlib_draw_indexed_indirect_helper_struct(&precomp_ctx, indirect_grid,
+                                                     indirect_barrier, args);
++         batch->hoisting = false;
+       } else if (draw->info.indirect.buffer_dev_addr != 0) {
+          const struct panlib_draw_indirect_helper_args args = {
+             .cmd = draw->info.indirect.buffer_dev_addr,
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c
+index 0e990d5..2df9446 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_precomp.c
+@@ -117,6 +117,12 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
+    bool suppress_prefetch =
+       (barrier & PANLIB_BARRIER_JM_SUPPRESS_PREFETCH) != 0;
+ 
++   if (batch->hoisting) {
++      /* No barrier or prefetch suppression: see panvk_jc_add_hoisted(). */
++      panvk_per_arch(jc_add_hoisted)(batch, MALI_JOB_TYPE_COMPUTE, grid.jm.local_dep,
++                           grid.jm.global_dep, &job);
++      return;
++   }
+    pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE, job_barrier,
+                   suppress_prefetch, grid.jm.local_dep, grid.jm.global_dep,
+                   &job, false);
+-- 
+2.43.0
+

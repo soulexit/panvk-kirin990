@@ -1,0 +1,44 @@
+From 702d89620369570aae15a4dc3d06e8c13d47575e Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 13:52:33 +0300
+Subject: [PATCH 28/36] panvk/v7: IDVS on Mali-G76
+
+The vendor driver uses INDEXED_VERTEX (IDVS) jobs on the G76 (job chain
+dump of the Kirin 990 blob), and in NieR:Automata IDVS halved the
+vertex/tiler time with no visible artefact. Keep the quirk for G72 and
+v6. PANVK_V7_IDVS=0 turns it off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_vX_shader.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index f146d68..515c118 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -4942,7 +4942,7 @@ panvk_compile_shader(struct panvk_device *dev,
+     *   passthrough reads its varyings too;
+     * - it writes memory: the vertex store dedup (jm-v7 046) guards the
+     *   vertex job's invocations;
+-    * - G72/G76, where JimVulkan measured INDEXED_VERTEX jobs completing
++    * - G72, where JimVulkan measured INDEXED_VERTEX jobs completing
+     *   without writing positions (the vendor driver uses VERTEX + TILER).
+     * - any v6 GPU (G71/G72), until measured on a device.
+     * PANVK_V7_IDVS=0 keeps it off everywhere (A/B), =1 also allows it on
+@@ -4954,8 +4954,10 @@ panvk_compile_shader(struct panvk_device *dev,
+       /* jm-v7 092: every v6 part (G71 0x6000 too, same generation as G72,
+        * never measured), plus G76.
+        */
+-      const bool idvs_quirk = PAN_ARCH == 6 || prod == 0x6201 /* G72 */ ||
+-                              prod == 0x7201 /* G76 */;
++      /* G76 (Kirin 990): IDVS measured on NieR:Automata in Winlator
++       * halves the vertex/tiler time with no visible artefacts, so it is
++       * on there (PANVK_V7_IDVS=0 turns it off again). */
++      const bool idvs_quirk = PAN_ARCH == 6 || prod == 0x6201 /* G72 */;
+       const bool polygon_mode =
+          panvk_v7_vs_may_draw_nonfill(&dev->vk.enabled_features, state);
+       nir_shader_gather_info(info->nir, nir_shader_get_entrypoint(info->nir));
+-- 
+2.43.0
+

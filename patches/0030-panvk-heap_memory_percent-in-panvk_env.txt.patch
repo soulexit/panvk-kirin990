@@ -1,0 +1,43 @@
+From 2b1aa26463a97f55397fa37aae62c3cfa895a699 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 13:52:33 +0300
+Subject: [PATCH 30/36] panvk: heap_memory_percent in panvk_env.txt
+
+The heap size sets DXVK's allocation chunk size (256 MiB above ~3.8 GiB
+of heap); allow the driconf option through the env file so it can be
+lowered inside Winlator.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_instance.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index 0906941..c6b3d08 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -293,7 +293,7 @@ panvk_init_dri_options(struct panvk_instance *instance)
+ /* Testing aid: KEY=VALUE lines from /sdcard/Download/panvk_env.txt are put
+  * in the environment when the driver is loaded, so options can be changed
+  * inside apps (Winlator) whose environment cannot be edited.  Only PANVK_*,
+- * PAN_* and MESA_* keys; existing variables are kept. */
++ * PAN_*, MESA_* and heap_memory_percent; existing variables are kept. */
+ static void __attribute__((constructor))
+ panvk_load_env_file(void)
+ {
+@@ -310,8 +310,11 @@ panvk_load_env_file(void)
+       /* "!KEY=VALUE" replaces a variable the app already set. */
+       const bool force = line[0] == '!';
+       const char *key = force ? line + 1 : line;
++      /* Plus heap_memory_percent: driconf reads options from variables of
++       * the same name, and the heap size sets DXVK's allocation chunk
++       * size (256 MiB chunks above ~3.8 GiB of heap). */
+       if (strncmp(key, "PANVK_", 6) && strncmp(key, "PAN_", 4) &&
+-          strncmp(key, "MESA_", 5))
++          strncmp(key, "MESA_", 5) && strcmp(key, "heap_memory_percent"))
+          continue;
+       setenv(key, eq + 1, force);
+    }
+-- 
+2.43.0
+

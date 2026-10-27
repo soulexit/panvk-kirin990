@@ -16,14 +16,15 @@ Companion repos: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kir
 
 ## At a glance
 
-| | Previous Kirin 990 Winlator pack | This driver (1.1.0-winlator) |
+| | Previous Kirin 990 Winlator pack | This driver (1.2.0-winlator) |
 |---|---|---|
 | D3D11 (AIO cube) | works | ~260–270 FPS |
 | D3D9 (AIO cube) | ~5 FPS | **~74 FPS** with the Performance emulator preset (see *Settings*) |
 | DXVK 2.x requirements (robustness2, nullDescriptor, …) | missing | all 56 hard requirements present |
 | Geometry shaders / tessellation / transform feedback | advertised but not implemented (GPU hang) | implemented (emulated), tests pass |
 | VKD3D-Proton (D3D12) | no | feature level 11_0, shader model 6.5 |
-| NieR:Automata | GPU hang on the boot screen | reaches title screen and main menu (~20 FPS) |
+| NieR:Automata | GPU hang on the boot screen | title screen and menu ~20 FPS; **in game still very slow** (vertex shading in its large draws), heavy batches 188/110 → 117/72 ms in 1.2.0 |
+| Need for Speed: Most Wanted (D3D9, low) | – | 1.2.0: indexed draws/s 11 500 → 27 300, submit→done 88 → 18 ms (was ~22 FPS, GPU-bound on per-draw jobs) |
 | Vulkan CTS (dEQP-VK 1.4.7.0) | – | 94 k cases pass in a 1/10 sample of the whole suite; API/info group 18 failures of 20 k (was 610). See [docs/CTS.md](docs/CTS.md) |
 
 ## Device
@@ -34,27 +35,30 @@ Companion repos: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kir
 | SoC / GPU | Kirin 990 / Mali-G76 MC16 (Bifrost, arch v7) |
 | Android | 10 (EMUI 12), API 29, kernel 4.14.116 |
 | Kernel GPU driver | stock `mali_kbase`, JM, uAPI 11.16 (56-byte atoms) |
-| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.1.0-winlator (Mesa 26.3.0-devel)`, Vulkan 1.3.363, 165 device extensions |
+| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.2.0-winlator (Mesa 26.3.0-devel)`, Vulkan 1.3.363, 165 device extensions |
 
 Also checked on a Galaxy A51 (Exynos 9611, Mali-G72 MP3, AOSP 16, kbase uAPI 11.35):
 same build runs; all tests pass (see *Results*).
 
 ## Install
 
-1. Download `panvk-g76-kirin990-1.1.0-winlator.zip` from the
+1. Download `panvk-g76-kirin990-1.2.0-winlator.zip` from the
    [releases](https://github.com/soulexit/panvk-kirin990-winlator/releases).
 2. Winlator → **Contents** (or the AdrenoTools/driver manager) → install the zip
    (do not unzip it).
 3. In the container (or the game shortcut's settings), set the drivers as in *Settings*.
 
-Release `1.1.0-winlator` (pre-release):
+Release `1.2.0-winlator` (pre-release):
 
 ```text
-zip:     panvk-g76-kirin990-1.1.0-winlator.zip
-sha256:  31769bbb30c6b8650baee8b3a95e2aeba35bbb2986fced5127691569043252a8
-.so:     3cdc670b832298bd0a1661d6efbd8c210ff7a1c514981f81fa74c2fa0f86fd13
-source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0027 (tree 2b001a2bfd)
+zip:     panvk-g76-kirin990-1.2.0-winlator.zip
+sha256:  55868e39f97b1f6eed2cb8aca61088e1733bbb74fa1ac98e54a2c97e7f270a57
+.so:     1f5d8e7f039eb4cb461445a4504ee5539f2631f94766812a8144399cdfbf262f
+source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0036 (tree ded07de903)
 ```
+
+1.1.0-winlator (CTS fixes, tree 2b001a2bfd) was not published separately; its changes
+are in 1.2.0.
 
 Previous release `1.0.0-winlator`:
 
@@ -74,7 +78,7 @@ These are the settings all results below were measured with (Winlator cmod 4.1).
 
 | Setting | Value | Why |
 |---|---|---|
-| **Graphics Driver** | `PanVK G76 Kirin 990 1.1.0-winlator` | the game renders with PanVK |
+| **Graphics Driver** | `PanVK G76 Kirin 990 1.2.0-winlator` | the game renders with PanVK |
 | **Renderer Driver** | **System** (the phone's own Mali driver) | Winlator's screen compositor faults on PanVK on the P40 → black screen. With System the game still renders on PanVK. |
 | **Box64 preset** (x86_64 containers) | **Performance** | COMPATIBILITY enables `BOX64_DYNAREC_STRONGMEM=1`: every emulated memory access gets a barrier. The AIO D3D9 test spent 99 % of its CPU time in one emulated byte-swizzle loop (profiled with `simpleperf`, PanVK was 0.17 %). Performance: D3D9 12 → 60 FPS (A51), 5.5 → ~74 FPS (P40). Use COMPATIBILITY only for a game that breaks. |
 | **FEXCore preset** (ARM64EC containers) | the fastest one / TSO off | same effect as STRONGMEM above |
@@ -149,6 +153,13 @@ requests linear buffers itself).
 | 0025 | **GPU hang with images in vertex shaders**: the descriptor copy job got a byte offset where it adds a buffer index; the vertex job read past its attribute table. Also present in upstream Mesa. |
 | 0026 | Null image descriptors: size/level/sample queries returned 1 instead of 0; format-less storage-image loads returned non-zero. |
 | 0027 | Debugging knobs used for the CTS work (`PANVK_NO_LWG`, `PANVK_TRACE_JC`, `PANVK_IMPORT_LOG`). |
+| 0028 | IDVS (index-driven vertex shading) on the G76, as the vendor driver does: NieR's vertex/tiler batches about halved. `PANVK_V7_IDVS=0` turns it off. |
+| 0029, 0030 | One device-wide shader stack buffer instead of one per command buffer (NieR: driver memory 1 550 → 1 160 MiB; Android's low-memory killer had been closing the game); `heap_memory_percent` from `panvk_env.txt`. |
+| 0031, 0033 | GPU profiler lines (memory, draws, shaders); `BIFROST_*` keys and `PANVK_STDERR_FILE` in `panvk_env.txt` for shader dumps. |
+| 0032 | Index-range helper jobs of indexed draws moved to the head of the batch behind one barrier, instead of a prefetch stall per draw. |
+| **0034** | **Robust storage-buffer loads** (DXVK's robustBufferAccess2) were `if`-guarded 32-bit loads, one per clause: NieR's skinning shaders ran at 0.04 instructions/cycle. Now straight-line, and consecutive 32-bit loads of one buffer become one 16-byte load with per-component bounds checks. NieR heavy batches 188/110 → 117/72 ms. |
+| **0035** | **One index-range helper job per batch** instead of one per indexed draw (~35 µs of job-manager time each). NFS: Most Wanted 11 500 → 27 300 indexed draws/s. |
+| **0036** | **Vertex shaders could read stale descriptor tables** on draws without IDVS since 0032 (63 CTS vertex-shader cases, wrong rendering / lost device): draws now wait for their descriptor copy job. |
 | 0005, 0006, 0008, 0009, 0011, 0013–0018 | Diagnostics (off unless enabled in `panvk_env.txt`): swapchain pixel check, extension hiding, failed-job batch description, GPU-time profiler, wait/latency statistics. |
 
 Not in this series but required for Winlator: Android-only WSI (`-Dplatforms=android`).
@@ -186,10 +197,10 @@ swapchain and every DXVK version fails at `vkAcquireNextImageKHR`.
 
 - **PanVK as Winlator's *Renderer Driver*** → black screen on the P40 (the compositor's
   first fragment job faults the GPU context). Use Renderer Driver = System.
-- **NieR performance (~20 FPS title screen) is GPU-bound**: jobs are in flight ~100 % of
-  the time. The largest cost is per-draw: every indexed draw runs a GPU index-range
-  helper before its vertex job (~0.25 ms per draw). Huawei's governor also keeps the
-  G76 at 208–509 MHz instead of 600 MHz (not changeable without root).
+- **NieR:Automata in game is still very slow.** It is GPU-bound in vertex (position)
+  shading of its large draws (~17 500 indices each). 1.2.0 cut those batches by about
+  a third; more is needed. Huawei's governor also keeps the G76 at 208–509 MHz instead
+  of 600 MHz (not changeable without root).
 - No sparse resources → VKD3D-Proton FL 12_0 titles don't start.
 - Open CTS failures (details in [docs/CTS.md](docs/CTS.md)): GPU hangs in tessellation
   with storage images in the evaluation shader and in some adjacency-primitive draws
@@ -202,7 +213,7 @@ Full investigation log: [docs/FINDINGS.md](docs/FINDINGS.md).
 
 ## Diagnostics (`/sdcard/Download/panvk_env.txt`)
 
-`KEY=VALUE` lines (only `PANVK_*`, `PAN_*`, `MESA_*`) are put in the environment when
+`KEY=VALUE` lines (only `PANVK_*`, `PAN_*`, `MESA_*`, `BIFROST_*` and `heap_memory_percent`) are put in the environment when
 the driver loads; a leading `!` overrides a variable the app already set.
 
 | Option | Effect |
@@ -214,6 +225,11 @@ the driver loads; a leading `!` overrides a variable the app already set.
 | `PANVK_OVERLAP=1` | re-enable the overlap mode (not recommended on G76) |
 | `PANVK_GRALLOC_GUESS_LINEAR=0` | refuse buffers without mapper metadata (old behaviour) |
 | `PANVK_JM_EXPORT_NOWAIT=1` | A/B only: sync-file export without waiting |
+| `heap_memory_percent=0.35` | report a smaller device heap, so DXVK keeps less memory (NieR) |
+| `PANVK_V7_IDVS=0` / `PANVK_V7_BATCH_MINMAX=0` / `PANVK_V7_HOIST=0` | A/B: no IDVS / one helper job per draw / helpers in place |
+| `PANVK_V7_NO_SSBO_VEC=1` / `PANVK_V7_BRANCHY_SSBO=1` | A/B: no 16-byte merge of storage-buffer loads / guarded loads |
+| `PANVK_SSBO_VEC_LOG=1` | log per shader how many storage-buffer loads were merged |
+| `BIFROST_MESA_DEBUG=shaders` + `PANVK_STDERR_FILE=/sdcard/Download/x.txt` | dump compiled shaders from a Winlator game |
 
 Failed GPU jobs are always logged (`panvk: failed atom N ran: …`).
 
@@ -222,7 +238,7 @@ Failed GPU jobs are always logged (`panvk: failed atom N ran: …`).
 ```bash
 export ANDROID_NDK_ROOT=/path/to/android-ndk-r30
 scripts/prepare-tree.sh work          # Mesa 5a07217f + zenithblue series + patches/
-scripts/build-android.sh work 1.1.0-winlator   # → work/dist/panvk-g76-kirin990-1.1.0-winlator.zip
+scripts/build-android.sh work 1.2.0-winlator   # → work/dist/panvk-g76-kirin990-1.2.0-winlator.zip
 scripts/build-tests.sh work           # → out/tests, out/probes
 scripts/deploy-tests.sh work/dist/libvulkan_panfrost.so
 adb shell sh /data/local/tmp/run-tests.sh /data/local/tmp/drv
@@ -230,6 +246,12 @@ scripts/build-cts.sh work             # optional: dEQP-VK for Android, → work/
 adb push work/cts-dist/. /data/local/tmp/cts/
 scripts/run-cts.sh work/dist/libvulkan_panfrost.so caselist.txt results/
 ```
+
+Performance tools (built by hand with the NDK clang, run over adb): `tests/stress/idraw.c`
+(indexed-draw cost; part of the stress tests), `tests/ssbovec/` (robust 16-byte load
+check), `tests/tools/hwcnt.c` (Mali-G76 hardware counters, no root),
+`tests/tools/jobdump.c` (`LD_PRELOAD` job-chain dump), `tests/tools/halshim.c` (vendor
+driver as an ICD, for comparisons).
 
 Host requirements: meson, ninja, python3 (mako, pyyaml), LLVM + clang + libclc +
 SPIRV-LLVM-Translator (for Mesa's host code generators), glslang, xxd.

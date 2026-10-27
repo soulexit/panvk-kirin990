@@ -1,0 +1,18 @@
+#version 450
+/* DXVK-style structured-buffer read: 4 consecutive 32-bit members at a
+ * 16-byte-aligned dynamic offset (what panvk merges into one 16-byte load). */
+layout(local_size_x = 64) in;
+struct S { uint a, b, c, d; };
+layout(set = 0, binding = 0) readonly buffer In { S s[]; } src;
+layout(set = 0, binding = 0) readonly buffer InW { uint w[]; } srcw;
+layout(set = 0, binding = 1) buffer Out { uvec4 o[]; } dst;
+layout(set = 0, binding = 2) buffer Out2 { uvec4 o[]; } dst2;
+void main()
+{
+   uint i = gl_GlobalInvocationID.x;
+   const uint k = i * 3u + 1u;
+   dst.o[i] = uvec4(src.s[k].a, src.s[k].b, src.s[k].c, src.s[k].d);
+   /* DXVK style: dword array, byte offset (k * 4 + c) * 4 */
+   dst2.o[i] = uvec4(srcw.w[k * 4u + 0u], srcw.w[k * 4u + 1u], srcw.w[k * 4u + 2u],
+                     srcw.w[k * 4u + 3u]);
+}

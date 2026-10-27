@@ -1,0 +1,55 @@
+From ded07de9036e862aacd8f32844a3376f5ac3f2e1 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Tue, 27 Oct 2026 03:53:51 +0300
+Subject: [PATCH 36/36] panvk/jm: draws wait for their descriptor copy job
+
+The vertex/IDVS job of a draw only depended on its index range helper,
+which used to depend on the draw's descriptor copy job. A hoisted or
+batched helper runs at the head of the batch with no such dependency, so
+the vertex shader could start before its descriptor tables were copied and
+read stale ones: 63 dEQP-VK.glsl.*_vertex cases failed without IDVS (wrong
+image, then lost device), on every build since helper hoisting. The
+vertex and IDVS jobs now depend on the copy job directly.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c | 18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 6d3122c..ee177ee 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -3668,18 +3668,22 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+       }
+ 
+       /* Grab the index of the indirect helper job. A batched helper has
+-       * none: it runs before the barrier at the head of the batch, so the
+-       * draw only waits for its descriptor copy job. */
+-      uint32_t prev_job =
+-         batched_helper ? copy_desc_job_id : batch->vtc_jc.job_index;
+-
++       * none: it runs before the barrier at the head of the batch. */
++      uint32_t prev_job = batched_helper ? 0 : batch->vtc_jc.job_index;
++
++      /* The draw also waits for its descriptor copy job: a hoisted or
++       * batched index range helper does not (it runs at the head of the
++       * batch), so prev_job alone no longer orders the two, and the vertex
++       * shader read stale descriptor tables (glsl.*_vertex cases without
++       * IDVS since helper hoisting). */
+       if (vs->info.vs.idvs) {
+          pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_INDEXED_VERTEX, false,
+-                        false, 0, prev_job, &draw->jobs.idvs, false);
++                        false, copy_desc_job_id, prev_job, &draw->jobs.idvs,
++                        false);
+       } else {
+          unsigned vjob_id =
+             vs_job ? pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_VERTEX,
+-                                    false, true, 0, prev_job,
++                                    false, true, copy_desc_job_id, prev_job,
+                                     &draw->jobs.vertex, false)
+                    : prev_job;
+ 
+-- 
+2.43.0
+

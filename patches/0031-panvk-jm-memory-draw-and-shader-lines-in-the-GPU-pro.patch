@@ -1,0 +1,150 @@
+From 8a457cca98690ee8bc90abcb884bcdcb3f7ead75 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 26 Oct 2026 13:52:44 +0300
+Subject: [PATCH 31/36] panvk/jm: memory, draw and shader lines in the GPU
+ profile
+
+With PANVK_GPU_PROF=1 the report also gives the application's
+VkDeviceMemory and the driver's own BOs by kind (live/peak MiB), indexed
+draws per second with their average index count, and one line per
+compiled shader that needs stack memory or more than 32 registers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c | 30 +++++++++++++++++++++
+ src/panfrost/vulkan/panvk_device_memory.c   | 10 +++++++
+ src/panfrost/vulkan/panvk_priv_bo.h         |  5 ++++
+ src/panfrost/vulkan/panvk_vX_shader.c       | 25 +++++++++++++++++
+ 4 files changed, 70 insertions(+)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index b9006e8..6abb68c 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -231,6 +231,36 @@ panvk_gprof_report_locked(uint64_t now)
+              panvk_gprof_inflight_ns / 1e6 / secs);
+    panvk_gprof_lat_ns = panvk_gprof_lat_max = panvk_gprof_lat_n = 0;
+    panvk_gprof_inflight_ns = 0;
++   {
++      /* GPU memory: the application's VkDeviceMemory, then the driver's own
++       * BOs by kind (live MiB / peak MiB). */
++      static const char *const names[PANVK_MEM_KIND_COUNT] = {
++         "misc", "devpool", "shader", "cmd_cs", "cmd_desc", "cmd_tls",
++         "dev_tls", "descpool", "bc_raw", "utrace", "otherpool",
++      };
++      char buf[512];
++      int n = 0;
++      uint64_t drv = 0;
++      for (unsigned k = 0; k < PANVK_MEM_KIND_COUNT; k++) {
++         const uint64_t b = p_atomic_read(&panvk_mem_stats.bytes[k]);
++         drv += b;
++         if (!b && !panvk_mem_stats.peak[k])
++            continue;
++         n += snprintf(buf + n, sizeof(buf) - MIN2(n, sizeof(buf)),
++                       " %s %.0f/%.0f", names[k], b / 1048576.0,
++                       panvk_mem_stats.peak[k] / 1048576.0);
++         if (n >= (int)sizeof(buf))
++            break;
++      }
++      mesa_logi("GPROF mem MiB: app %.0f (%llu allocs, peak %.0f), driver "
++                "%.0f:%s", panvk_mem_stats.app_B / 1048576.0,
++                (unsigned long long)panvk_mem_stats.app_count,
++                panvk_mem_stats.app_peak_B / 1048576.0, drv / 1048576.0, buf);
++      const uint64_t nd = p_atomic_xchg(&panvk_mem_stats.draws_indexed, 0);
++      const uint64_t ni = p_atomic_xchg(&panvk_mem_stats.draw_indices, 0);
++      mesa_logi("GPROF draws: %.0f indexed draws/s recorded, avg %.0f indices",
++                nd / secs, nd ? (double)ni / nd : 0.0);
++   }
+    for (unsigned r = 0; r < 16; r++) {
+       int best = -1;
+       for (unsigned i = 0; i < panvk_gprof_nkinds; i++)
+diff --git a/src/panfrost/vulkan/panvk_device_memory.c b/src/panfrost/vulkan/panvk_device_memory.c
+index cf9f4c0..c4016b5 100644
+--- a/src/panfrost/vulkan/panvk_device_memory.c
++++ b/src/panfrost/vulkan/panvk_device_memory.c
+@@ -10,6 +10,7 @@
+ #include "panvk_android.h"
+ #include "panvk_device.h"
+ #include "panvk_device_memory.h"
++#include "panvk_priv_bo.h"
+ #include "panvk_entrypoints.h"
+ 
+ #include "pan_props.h"
+@@ -235,6 +236,13 @@ panvk_AllocateMemory(VkDevice _device,
+ 
+    p_atomic_add(&physical_device->memory.heap_used,
+                 (uint64_t)pan_kmod_bo_size(mem->bo));
++   {
++      const uint64_t v = p_atomic_add_return(&panvk_mem_stats.app_B,
++                                             pan_kmod_bo_size(mem->bo));
++      p_atomic_inc(&panvk_mem_stats.app_count);
++      if (v > p_atomic_read_relaxed(&panvk_mem_stats.app_peak_B))
++         p_atomic_set(&panvk_mem_stats.app_peak_B, v);
++   }
+ 
+    *pMem = panvk_device_memory_to_handle(mem);
+ 
+@@ -270,6 +278,8 @@ panvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
+ 
+    p_atomic_add(&physical_device->memory.heap_used,
+                 -((int64_t)pan_kmod_bo_size(mem->bo)));
++   p_atomic_add(&panvk_mem_stats.app_B, -((int64_t)pan_kmod_bo_size(mem->bo)));
++   p_atomic_dec(&panvk_mem_stats.app_count);
+ 
+    if (device->debug.decode_ctx) {
+       pandecode_inject_free(device->debug.decode_ctx, mem->addr.dev,
+diff --git a/src/panfrost/vulkan/panvk_priv_bo.h b/src/panfrost/vulkan/panvk_priv_bo.h
+index e2860aa..fd1ed65 100644
+--- a/src/panfrost/vulkan/panvk_priv_bo.h
++++ b/src/panfrost/vulkan/panvk_priv_bo.h
+@@ -49,6 +49,11 @@ struct panvk_mem_stats {
+    uint64_t cmdpool_trim_bos, cmdpool_trim_B;
+    /* Device TLS BOs freed early (csf-v11 097 grow-only list). */
+    uint64_t dev_tls_freed_B;
++   /* Application VkDeviceMemory (panvk_device_memory.c): live bytes,
++    * allocations and peak, for the GPU profile report. */
++   uint64_t app_B, app_count, app_peak_B;
++   /* Indexed draws recorded and their index counts (GPU profile report). */
++   uint64_t draws_indexed, draw_indices;
+ };
+ 
+ extern struct panvk_mem_stats panvk_mem_stats;
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 515c118..4935eb5 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -3794,6 +3794,31 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
+    struct util_dynarray binary = UTIL_DYNARRAY_INIT;
+    pan_shader_compile(nir, &input, &binary, &shader->info);
+ 
++   /* GPU profile: shaders that need stack memory (spills, local arrays) or
++    * more than 32 registers (half the threads per core on Bifrost). */
++   if (shader->info.tls_size || shader->info.work_reg_count > 32) {
++      static int gprof = -1;
++      if (gprof < 0) {
++         const char *e = getenv("PANVK_GPU_PROF");
++         gprof = e && e[0] == '1';
++      }
++      if (gprof) {
++         const uint8_t *h = nir->info.source_blake3;
++         mesa_logi("GPROF shader %s src %02x%02x%02x%02x%02x%02x: stack %u B/thread, "
++                   "%u regs%s, %u B code",
++                   _mesa_shader_stage_to_abbrev(nir->info.stage), h[0], h[1],
++                   h[2], h[3], h[4], h[5], shader->info.tls_size,
++                   shader->info.work_reg_count,
++#if PAN_ARCH < 9
++                   nir->info.stage == MESA_SHADER_VERTEX && shader->info.vs.idvs
++                      ? " idvs" : "",
++#else
++                   "",
++#endif
++                   (unsigned)util_dynarray_num_elements(&binary, uint8_t));
++      }
++   }
++
+    /* Propagate potential additional FAU values into the panvk info struct. */
+    /* FAU consts are pushed as 32bit values, but total_count is for 64bit
+     * ones. */
+-- 
+2.43.0
+

@@ -84,6 +84,9 @@ dx7_buffer(struct dx7 *t, VkDeviceSize size, VkBufferUsageFlags usage,
    VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                .allocationSize = mr.size,
                                .memoryTypeIndex = t->host_mi};
+   /* DX7_MEMTYPE=n: allocate buffers from memory type n (A/B tests). */
+   if (getenv("DX7_MEMTYPE"))
+      mai.memoryTypeIndex = atoi(getenv("DX7_MEMTYPE"));
    CK(vkAllocateMemory(t->dev, &mai, NULL, mem), "BufMem");
    CK(vkBindBufferMemory(t->dev, *buf, *mem, 0), "BufBind");
    if (data) {
@@ -289,6 +292,7 @@ struct dx7_pipe_desc {
    const VkRect2D *scissors;
    uint32_t vertex_stride;
    int primitive_restart;
+   int rasterizer_discard;
 };
 
 static VkPipeline
@@ -345,6 +349,7 @@ dx7_pipeline(struct dx7 *t, const struct dx7_pipe_desc *d)
       .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
       .polygonMode = d->polygon_mode,
       .cullMode = d->cull_mode,
+      .rasterizerDiscardEnable = d->rasterizer_discard,
       .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
       .lineWidth = 1.0f};
    VkPipelineMultisampleStateCreateInfo ms = {

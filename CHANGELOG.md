@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.2.0-winlator (testing) — 2026-10-27
+
+Performance in games, measured with Mali hardware counters (see
+[docs/FINDINGS.md](docs/FINDINGS.md) §6). Includes the 1.1.0 fixes below (1.1.0 was not
+published separately).
+
+- **Many small indexed draws** (D3D9 games): one index-range helper job per batch instead
+  of one per draw. Need for Speed: Most Wanted: 11 500 → 27 300 indexed draws/s,
+  submit→done 88 → 18 ms.
+- **Fixed: vertex shaders could read stale descriptor tables** (wrong rendering, lost
+  device) on draws without IDVS, since the helper jobs moved to the head of the batch.
+- **Robust storage-buffer loads** (DXVK's robustBufferAccess2): straight-line code, and
+  consecutive 32-bit loads merged into 16-byte loads. NieR:Automata's heavy batches
+  188/110 → 117/72 ms.
+- IDVS (index-driven vertex shading) on the G76: NieR vertex/tiler time about halved.
+- One device-wide shader stack buffer: NieR's driver memory 1 550 → 1 160 MiB (Android's
+  low-memory killer had been closing the game); `heap_memory_percent` settable in
+  `panvk_env.txt`.
+- Index-range helpers run at the head of the batch behind one barrier (no stall per draw).
+- GPU profiler: memory, draw-path and shader lines; `PANVK_STDERR_FILE`, `BIFROST_*` keys
+  in `panvk_env.txt` for shader dumps.
+- Tools: draw benchmark `tests/stress/idraw.c`, robustness check `tests/ssbovec/`,
+  hardware-counter reader, job-chain dumper and vendor-driver loader in `tests/tools/`.
+
+Still slow: NieR:Automata in game (vertex shading in its large draws).
+
 ## 1.1.0-winlator (testing) — 2026-10-26
 
 Advertised extensions checked with the Khronos Vulkan CTS (dEQP-VK 1.4.7.0) on the P40;

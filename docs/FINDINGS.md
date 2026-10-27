@@ -69,6 +69,54 @@ with compute jobs.
   (other helper layouts): no change.
 - GPU clock under Huawei's governor: 208–509 MHz, never 600 MHz (`gpufreq/cur_freq`).
 
-Next: avoid the per-draw helper (CPU-known index ranges, caching ranges per index
-buffer + range), and look at the Renderer-Driver compositor fault on a device with
-`dmesg` access.
+## 6. In-game performance (1.2.0)
+
+Measured in game with the GPU profiler (`PANVK_GPU_PROF=1`) and the Mali-G76 hardware
+counters, read through the kbase counter reader without root
+([`tests/tools/hwcnt.c`](../tests/tools/hwcnt.c)). Job chains were compared with the
+vendor driver through an `ioctl` hook ([`tests/tools/jobdump.c`](../tests/tools/jobdump.c),
+[`tests/tools/halshim.c`](../tests/tools/halshim.c) loads the vendor driver as an ICD).
+
+**NieR:Automata in game: ~1 FPS** at first, with Android's low-memory killer ending the game.
+- Memory: one device-wide shader stack buffer instead of one per command buffer (0029)
+  and `heap_memory_percent` (0030): driver memory 1 550 → 1 160 MiB, and the game
+  survives.
+- IDVS (index-driven vertex shading, what the vendor driver uses) on the G76 (0028):
+  vertex/tiler batches about halved.
+- Counters: the tiler waited on position shading for almost all of its active time, the
+  shader cores ran 0.04 instructions/cycle, and short (sub-cache-line) reads outnumbered
+  full ones 10:1. Cause: with robustBufferAccess2 every storage-buffer load was an
+  `if`-guarded 32-bit load, alone in its clause. NieR's skinning vertex shaders do 30–80 of
+  them per vertex.
+- 0034: straight-line bounded loads, and consecutive 32-bit loads of one buffer merged
+  into 16-byte loads with per-component bounds checks. The merge first missed every
+  NieR load: DXVK computes byte offsets as `(dword_index + k) << 2`, and constant
+  folding hadn't run yet. Found with a per-shader merge log, fixed by splitting
+  offsets through add/mul/shift recursively. 1 880 of 2 003 bounded loads merged; big
+  batches 188/110 → 117/72 ms, draws/s ~1 000 → ~1 450.
+- Still GPU-bound in vertex shading (~730 ms of GPU time per frame in heavy scenes).
+
+**Need for Speed: Most Wanted (D3D9, low settings): ~22 FPS, GPU 100 % busy** but tiler and
+shader cores mostly idle.
+- ~520 small indexed draws per frame (~180 indices) cost 40 ms of vertex/tiler time:
+  ~77 µs per draw. On the draw benchmark ([`tests/stress/idraw.c`](../tests/stress/idraw.c))
+  PanVK took 48 µs per indexed draw and the vendor driver 10 µs; non-indexed draws cost the
+  same on both.
+- Job dumps: PanVK ran one index-range helper compute job per indexed draw, the vendor
+  driver three per batch. The job manager costs ~35 µs per job.
+- 0035: one helper job per batch, a workgroup per draw. Benchmark 22–25 → 7–9.5 ms
+  per 520 draws. In game: 11 500 → 27 300 indexed draws/s, submit→done 88 → 18 ms, GPU
+  no longer saturated. The first version only covered IDVS draws; a per-path draw
+  counter showed NFS's vertex shaders all run without IDVS.
+- Without IDVS, small draws are faster than with it (8 vs 12 ms on the benchmark).
+
+**Bug found on the way (0036).** Testing the batched helper without IDVS, 63
+`dEQP-VK.glsl.*_vertex` cases failed — on every build since the helpers moved to the
+head of the batch (0032). A draw's vertex job waited on its helper, and the helper on
+the draw's descriptor-copy job; hoisted, the helper no longer waits, so the vertex
+shader could read descriptor tables before they were copied. Bisected by build, then by
+switch (`PANVK_V7_HOIST=0` passes), then confirmed with a barrier and with an explicit
+dependency. The vertex and IDVS jobs now depend on the copy job directly.
+
+Next: NieR's vertex shading (position shading still dominates); the Renderer-Driver
+compositor fault.

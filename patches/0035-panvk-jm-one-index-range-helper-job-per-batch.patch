@@ -1,0 +1,379 @@
+From b3dfa18da0401c5c51c7cd69e5bb8a360317f443 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Tue, 27 Oct 2026 03:53:51 +0300
+Subject: [PATCH 35/36] panvk/jm: one index range helper job per batch
+
+Every small direct indexed draw had its own helper job (find the index
+range, patch the draw's descriptors). Hoisted to the head of the batch they
+no longer stall, but each job still cost the job manager ~35 us on the G76:
+Need for Speed: Most Wanted issues ~520 draws of ~180 indices per frame, so
+its vertex/tiler chain took 40 ms per frame, against ~5 ms for the vendor
+driver on the same draws (one compute job per batch).
+
+The folded helpers of hoisted draws now record their arguments in the batch
+(struct libpan_minmax_draw), and one panlib_draw_indexed_indirect_minmax_
+helper_batch job, a workgroup per draw, runs them when the batch is closed,
+ahead of the barrier. Batches split at the same draw count as before (the
+batched helpers count as jobs), so the indirect varying buffer is sized as
+before.
+
+520 indexed draws x 183 indices: 22-25 ms -> 7-9.5 ms per frame without
+IDVS (Need for Speed: Most Wanted's vertex shaders), 19-20 -> 12 ms with.
+In game: indexed draws/s 11,500 -> 27,300, submit-to-done 88 -> 18 ms.
+
+The GPU profile also counts indexed draws per helper path.
+PANVK_V7_BATCH_MINMAX=0 keeps one helper job per draw.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/libpan/draw_helper.cl           | 52 +++++++++++++++
+ src/panfrost/libpan/draw_helper.h            | 27 ++++++++
+ src/panfrost/vulkan/jm/panvk_cmd_buffer.h    |  5 ++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c | 44 ++++++++++++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c   | 70 ++++++++++++++++++--
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c  |  7 ++
+ src/panfrost/vulkan/panvk_priv_bo.h          |  4 ++
+ 7 files changed, 202 insertions(+), 7 deletions(-)
+
+diff --git a/src/panfrost/libpan/draw_helper.cl b/src/panfrost/libpan/draw_helper.cl
+index 57cf2d3..a0e9323 100644
+--- a/src/panfrost/libpan/draw_helper.cl
++++ b/src/panfrost/libpan/draw_helper.cl
+@@ -1676,6 +1676,58 @@ panlib_draw_indexed_indirect_minmax_helper(
+       tiler_job);
+ }
+ 
++/* panlib_draw_indexed_indirect_minmax_helper for every small direct indexed
++ * draw of a batch in one job, workgroup i doing draws[i]: each separate
++ * helper job cost the job manager ~35 us on the G76, which was most of the
++ * frame for games with hundreds of small draws (Need for Speed: Most
++ * Wanted: ~520 draws of ~180 indices, 77 us per draw).
++ */
++KERNEL(MINMAX_WG)
++panlib_draw_indexed_indirect_minmax_helper_batch(
++   constant struct libpan_minmax_draw *draws)
++{
++   local uint32_t tmin[MINMAX_WG];
++   local uint32_t tmax[MINMAX_WG];
++   uint32_t lmin, lmax;
++   constant struct libpan_minmax_draw *d = &draws[cl_group_id.x];
++   global VkDrawIndexedIndirectCommand *cmd =
++      (global VkDrawIndexedIndirectCommand *)d->cmd;
++   global uint8_t *index_buffer_ptr = (global uint8_t *)d->index_buffer_ptr;
++   const uint32_t index_size = d->index_size;
++   const uint32_t log2_size = index_size == 4 ? 2 : index_size == 2 ? 1 : 0;
++
++   index_minmax_strided(index_buffer_ptr, cmd->firstIndex, cmd->indexCount,
++                        log2_size, d->primitive_restart != 0, cl_local_id.x,
++                        MINMAX_WG, &lmin, &lmax);
++   index_minmax_wg_reduce(tmin, tmax, lmin, lmax);
++
++   if (cl_local_id.x != 0)
++      return;
++
++   const uint32_t min_vertex = tmin[0];
++   const uint32_t max_vertex = tmax[0];
++   global struct libpan_draw_helper_index_min_max_result *res =
++      (global struct libpan_draw_helper_index_min_max_result *)
++         d->index_min_max_res;
++   res->min = min_vertex;
++   res->max = max_vertex;
++
++   draw_indexed_indirect_body(
++      cmd, index_buffer_ptr, min_vertex, max_vertex, index_size,
++      d->primitive_vertex_count, d->attrib_bufs_valid, d->attribs_valid,
++      (global struct mali_attribute_buffer_packed *)d->varying_bufs_descs,
++      (global struct libpan_draw_helper_varying_buf_info *)d->varying_bufs_info,
++      (global struct mali_attribute_buffer_packed *)d->attrib_bufs_descs,
++      (global struct libpan_draw_helper_attrib_buf_info *)d->attrib_bufs_infos,
++      (global struct mali_attribute_packed *)d->attribs_descs,
++      (global struct libpan_draw_helper_attrib_info *)d->attribs_infos,
++      (global uint32_t *)d->first_vertex_sysval,
++      (global uint32_t *)d->first_instance_sysval,
++      (global uint32_t *)d->raw_vertex_offset_sysval,
++      (global uint8_t *)d->idvs_job, (global uint8_t *)d->vertex_job,
++      (global uint8_t *)d->tiler_job);
++}
++
+ /* Transform feedback from the geometry shader emulation. Per invocation it
+  * left how many complete primitives it emitted and a staging record for
+  * every vertex slot. Capture order is draw order, which is invocation order:
+diff --git a/src/panfrost/libpan/draw_helper.h b/src/panfrost/libpan/draw_helper.h
+index 58a5c89..d2a834a 100644
+--- a/src/panfrost/libpan/draw_helper.h
++++ b/src/panfrost/libpan/draw_helper.h
+@@ -26,6 +26,33 @@ enum panlib_varying_buf_id {
+    PANLIB_VARY_BUF_MAX,
+ };
+ 
++/* One draw of panlib_draw_indexed_indirect_minmax_helper_batch: the
++ * arguments of panlib_draw_indexed_indirect_minmax_helper, 8-byte aligned
++ * so they can be packed in an array. */
++struct libpan_minmax_draw {
++   uint64_t cmd;
++   uint64_t index_buffer_ptr;
++   uint64_t index_min_max_res;
++   uint64_t varying_bufs_descs;
++   uint64_t varying_bufs_info;
++   uint64_t attrib_bufs_descs;
++   uint64_t attrib_bufs_infos;
++   uint64_t attribs_descs;
++   uint64_t attribs_infos;
++   uint64_t first_vertex_sysval;
++   uint64_t first_instance_sysval;
++   uint64_t raw_vertex_offset_sysval;
++   uint64_t idvs_job;
++   uint64_t vertex_job;
++   uint64_t tiler_job;
++   uint32_t index_size;
++   uint32_t primitive_vertex_count;
++   uint32_t attrib_bufs_valid;
++   uint32_t attribs_valid;
++   uint32_t primitive_restart;
++   uint32_t pad;
++};
++
+ struct libpan_draw_helper_index_min_max_result {
+     uint32_t min;
+     uint32_t max;
+diff --git a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+index bab88ea..2401b4c 100644
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -58,6 +58,11 @@ struct panvk_batch {
+    struct pan_jc hoist_jc;
+    /* Set while recording jobs that go to hoist_jc. */
+    bool hoisting;
++#if PAN_ARCH < 9
++   /* struct libpan_minmax_draw of the batch's hoisted small indexed draws,
++    * done by one helper job when the batch is closed (jm-v7 batch minmax). */
++   struct util_dynarray minmax_draws;
++#endif
+    struct pan_jc frag_jc;
+    struct {
+       struct pan_ptr desc;
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index d5e4c0f..bb6914d 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -21,6 +21,8 @@
+ #include "panvk_cmd_draw.h"
+ #include "panvk_cmd_frame_shaders.h"
+ #include "panvk_cmd_pool.h"
++#include "panvk_cmd_precomp.h"
++#include "libpan/draw_helper.h"
+ #include "panvk_cmd_push_constant.h"
+ #include "panvk_device.h"
+ #include "panvk_entrypoints.h"
+@@ -243,9 +245,42 @@ panvk_per_arch(jc_add_hoisted)(struct panvk_batch *batch, unsigned type,
+    return index;
+ }
+ 
++#if PAN_ARCH < 9
++/* One helper job for all the batch's small indexed draws (see
++ * panlib_draw_indexed_indirect_minmax_helper_batch), with the other hoisted
++ * jobs: the draws' IDVS/vertex jobs come after the barrier that follows
++ * them. */
++static void
++emit_batched_minmax(struct panvk_cmd_buffer *cmdbuf, struct panvk_batch *batch)
++{
++   const unsigned n = util_dynarray_num_elements(&batch->minmax_draws,
++                                                 struct libpan_minmax_draw);
++   if (!n)
++      return;
++
++   const size_t size = n * sizeof(struct libpan_minmax_draw);
++   struct pan_ptr draws = panvk_cmd_alloc_dev_mem(cmdbuf, desc, size, 8);
++   if (draws.gpu) {
++      memcpy(draws.cpu, util_dynarray_begin(&batch->minmax_draws), size);
++
++      struct panvk_precomp_ctx precomp_ctx =
++         panvk_per_arch(precomp_cs)(cmdbuf);
++      batch->hoisting = true;
++      panlib_draw_indexed_indirect_minmax_helper_batch(
++         &precomp_ctx, panlib_1d_with_jm_deps(n, 0, 0), PANLIB_BARRIER_NONE,
++         draws.gpu);
++      batch->hoisting = false;
++   }
++   util_dynarray_clear(&batch->minmax_draws);
++}
++#endif
++
+ static void
+ splice_hoisted_jobs(struct panvk_cmd_buffer *cmdbuf, struct panvk_batch *batch)
+ {
++#if PAN_ARCH < 9
++   emit_batched_minmax(cmdbuf, batch);
++#endif
+    if (!batch->hoist_jc.first_job || !batch->vtc_jc.first_job)
+       return;
+ 
+@@ -660,6 +695,9 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
+ #endif
+    cmdbuf->cur_batch->event_ops = UTIL_DYNARRAY_INIT;
+    cmdbuf->cur_batch->vary_infos = UTIL_DYNARRAY_INIT;
++#if PAN_ARCH < 9
++   cmdbuf->cur_batch->minmax_draws = UTIL_DYNARRAY_INIT;
++#endif
+    /* jm-v7 106: with per-half indirect varying buffers, every batch takes
+     * its own allocator, in the buffer of its heap half. */
+ #if PAN_ARCH < 9
+@@ -724,6 +762,9 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
+ #endif
+       util_dynarray_fini(&batch->event_ops);
+       util_dynarray_fini(&batch->vary_infos);
++#if PAN_ARCH < 9
++      util_dynarray_fini(&batch->minmax_draws);
++#endif
+ 
+       vk_free(&cmdbuf->vk.pool->alloc, batch);
+    }
+@@ -754,6 +795,9 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
+ #endif
+       util_dynarray_fini(&batch->event_ops);
+       util_dynarray_fini(&batch->vary_infos);
++#if PAN_ARCH < 9
++      util_dynarray_fini(&batch->minmax_draws);
++#endif
+ 
+       vk_free(&cmdbuf->vk.pool->alloc, batch);
+    }
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 9d22523..6d3122c 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -3359,7 +3359,26 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+                       !draw->tess_phase && !draw->gs_varying_bufs &&
+                       enabled_layer_count == 1;
+ 
++   /* PANVK_V7_BATCH_MINMAX=0: one helper job per hoisted small indexed
++    * draw instead of one per batch. */
++   static int batch_minmax_knob = -1;
++   if (batch_minmax_knob < 0) {
++      const char *e = getenv("PANVK_V7_BATCH_MINMAX");
++      batch_minmax_knob = !(e && e[0] == '0');
++   }
++   const bool batch_minmax = batch_minmax_knob;
++   bool batched_helper = false;
++
+    if (draw->info.index.index_size) {
++      const unsigned path =
++         vs->info.writes_global                     ? 2
++         : draw->indirect_dep_job                   ? 3
++         : draw->tess_phase || draw->gs_varying_bufs ? 4
++         : enabled_layer_count != 1                 ? 5
++         : !fold_minmax                             ? 1
++         : !vs->info.vs.idvs                        ? 6
++                                                    : 0;
++      p_atomic_inc(&panvk_mem_stats.draw_path[path]);
+       p_atomic_inc(&panvk_mem_stats.draws_indexed);
+       p_atomic_add(&panvk_mem_stats.draw_indices, draw->cpu_count);
+       struct pan_ptr res = panvk_cmd_alloc_dev_mem(
+@@ -3558,10 +3577,39 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+             .tiler_job = draw->gs_varying_bufs ? 0 : draw->jobs.tiler.gpu,
+             .primitive_restart = draw->info.index.restart_enable,
+          };
+-         batch->hoisting = hoist;
+-         panlib_draw_indexed_indirect_minmax_helper_struct(
+-            &precomp_ctx, indirect_grid, indirect_barrier, args);
+-         batch->hoisting = false;
++         if (hoist && batch_minmax) {
++            /* Done with the batch's other small draws by one job when the
++             * batch is closed (emit_batched_minmax()). */
++            const struct libpan_minmax_draw d = {
++               .cmd = args.cmd,
++               .index_buffer_ptr = args.index_buffer_ptr,
++               .index_min_max_res = args.index_min_max_res,
++               .varying_bufs_descs = args.varying_bufs_descs,
++               .varying_bufs_info = args.varying_bufs_info,
++               .attrib_bufs_descs = args.attrib_bufs_descs,
++               .attrib_bufs_infos = args.attrib_bufs_infos,
++               .attribs_descs = args.attribs_descs,
++               .attribs_infos = args.attribs_infos,
++               .first_vertex_sysval = args.first_vertex_sysval,
++               .first_instance_sysval = args.first_instance_sysval,
++               .raw_vertex_offset_sysval = args.raw_vertex_offset_sysval,
++               .idvs_job = args.idvs_job,
++               .vertex_job = args.vertex_job,
++               .tiler_job = args.tiler_job,
++               .index_size = args.index_size,
++               .primitive_vertex_count = args.primitive_vertex_count,
++               .attrib_bufs_valid = args.attrib_bufs_valid,
++               .attribs_valid = args.attribs_valid,
++               .primitive_restart = args.primitive_restart,
++            };
++            util_dynarray_append(&batch->minmax_draws, d);
++            batched_helper = true;
++         } else {
++            batch->hoisting = hoist;
++            panlib_draw_indexed_indirect_minmax_helper_struct(
++               &precomp_ctx, indirect_grid, indirect_barrier, args);
++            batch->hoisting = false;
++         }
+       } else if (draw->info.indirect.buffer_dev_addr != 0 &&
+                  draw->info.index.index_size) {
+          const struct panlib_draw_indexed_indirect_helper_args args = {
+@@ -3619,8 +3667,11 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+          assert(false && "Invalid indirect draw");
+       }
+ 
+-      /* Grab the index of the indirect helper job */
+-      uint32_t prev_job = batch->vtc_jc.job_index;
++      /* Grab the index of the indirect helper job. A batched helper has
++       * none: it runs before the barrier at the head of the batch, so the
++       * draw only waits for its descriptor copy job. */
++      uint32_t prev_job =
++         batched_helper ? copy_desc_job_id : batch->vtc_jc.job_index;
+ 
+       if (vs->info.vs.idvs) {
+          pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_INDEXED_VERTEX, false,
+@@ -3669,7 +3720,12 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+     * the same time, because of how TLS works on Mali, we should not split too
+     * much as this will cause the TLS budget to go crazy.
+     */
+-   if (batch->vtc_jc.job_index > (5 * 1024)) {
++   /* Batched helpers count as the jobs they replace, so batches keep the
++    * size the indirect varying buffer is dimensioned for. */
++   if (batch->vtc_jc.job_index +
++          util_dynarray_num_elements(&batch->minmax_draws,
++                                     struct libpan_minmax_draw) >
++       (5 * 1024)) {
+       panvk_per_arch(cmd_close_batch)(cmdbuf);
+       batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
+       cmdbuf->state.gfx.vs.indirect_varying_bufs_infos = 0;
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 6abb68c..b17a9ce 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -260,6 +260,13 @@ panvk_gprof_report_locked(uint64_t now)
+       const uint64_t ni = p_atomic_xchg(&panvk_mem_stats.draw_indices, 0);
+       mesa_logi("GPROF draws: %.0f indexed draws/s recorded, avg %.0f indices",
+                 nd / secs, nd ? (double)ni / nd : 0.0);
++      uint64_t dp[7];
++      for (unsigned k = 0; k < 7; k++)
++         dp[k] = p_atomic_xchg(&panvk_mem_stats.draw_path[k], 0);
++      mesa_logi("GPROF draw paths/s: batched idvs %.0f nofold %.0f vswrites %.0f "
++                "indirdep %.0f tessgs %.0f multiview %.0f batched noidvs %.0f",
++                dp[0] / secs, dp[1] / secs, dp[2] / secs, dp[3] / secs,
++                dp[4] / secs, dp[5] / secs, dp[6] / secs);
+    }
+    for (unsigned r = 0; r < 16; r++) {
+       int best = -1;
+diff --git a/src/panfrost/vulkan/panvk_priv_bo.h b/src/panfrost/vulkan/panvk_priv_bo.h
+index fd1ed65..4a09635 100644
+--- a/src/panfrost/vulkan/panvk_priv_bo.h
++++ b/src/panfrost/vulkan/panvk_priv_bo.h
+@@ -54,6 +54,10 @@ struct panvk_mem_stats {
+    uint64_t app_B, app_count, app_peak_B;
+    /* Indexed draws recorded and their index counts (GPU profile report). */
+    uint64_t draws_indexed, draw_indices;
++   /* Indexed draws by index range helper path: batched, not folded, VS
++    * writes memory, waits on an indirect job, tess/GS, multiview, batched
++    * without IDVS. */
++   uint64_t draw_path[7];
+ };
+ 
+ extern struct panvk_mem_stats panvk_mem_stats;
+-- 
+2.43.0
+
