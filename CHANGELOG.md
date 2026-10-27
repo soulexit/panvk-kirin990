@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.2-winlator (testing) — 2026-10-27
+
+- **Faster skinned vertex shaders** (NieR:Automata), two compiler changes:
+  - integer compare + select become one `CSEL` instruction (0040): 14–17 % fewer
+    instructions in NieR's position shaders, 5–11 % faster per vertex;
+  - vertex shaders issue storage-buffer loads up to three ahead (0041): the IDVS tiler
+    waits on each vertex's position shader, so its latency counts, not the thread count;
+    a skinning shader paid one memory latency per bone-matrix row. 5–11 % faster per
+    vertex. In game: 32 % more triangles per GPU cycle at the same spot.
+- **NieR:Automata stuck in a loop at a loading point**: not the driver. DXVK holds a game
+  to 80 % of the reported heap, and `heap_memory_percent=0.35` capped NieR at 2 080 MB, so
+  it could not load the next area. `0.42` (cap ~2.5 GB) gets past it.
+- **D3D12 checked end to end** with `tests/tools/d3d12diag.c` through VKD3D-Proton 2.14.1
+  in Winlator: 14 draw/readback cases (buffers, root constants, root and table CBVs, depth,
+  indexed cube, 852×586 padded rows, BGRA8, RGB10A2, MSAA resolve) and presenting to a
+  top-level and a child window all pass. AIO Graphics Test's D3D12 cube shows.
+- Tools: `tests/tools/d3d12probe.c` (VKD3D-Proton device requirements and bindless heap
+  layouts), `tests/tools/d3d12diag.c`; `hwcnt` prints counter indices.
+
 ## 1.2.1-winlator (testing) — 2026-10-27
 
 - **Renderer Driver = PanVK works** (Winlator's own Vulkan compositor): every present

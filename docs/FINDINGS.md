@@ -147,4 +147,45 @@ payloads with `vk_drm_syncobj_copy_payloads`, i.e. `SYNCOBJ_TRANSFER`, which the
 sync-object emulation does not have. 0039 turns that path off on kbase. Then: 60 presents/s,
 0.76 ms of GPU per frame, no failed jobs — the terminated jobs were a side effect.
 
-Next: register pressure of NieR's position shaders.
+## 8. 1.2.2: what limits NieR's vertex shading, D3D12
+
+**Register pressure was not it.** The heavy position shaders (35–40 registers) run at half
+the thread count. On the replay benchmark ([`spvcomp`](../tests/tools/spvcomp/)), forcing
+shaders that fit in 32 registers to 64 (half the threads) changed nothing, and getting
+one 34-register shader into 32 changed nothing either. A trivial vertex shader costs
+~3.5 ns/vertex; the rest scales with instruction count.
+
+**Fewer instructions (0040).** Robust storage-buffer loads select each component on an
+unsigned bounds compare, emitted as ICMP + MUX. Bifrost's CSEL compares and selects in one
+instruction: 14–17 % fewer instructions, 5–11 % per vertex. A CTS run flagged one
+`robustness2 … storage_image … null_descriptor` case; it flips with unrelated code changes
+on 1.2.1 too (fails there with `BIFROST_MESA_DEBUG=noopt`), as do 36 others of that family.
+
+**Latency (0041).** Tiler counters in game (3 s): 80 M triangles, 1.7 M visible; vertex cache
+92 % hits; position-shading requests = cache misses (one vertex per request); the tiler
+waited on position shading 94 % of its active time; shader cores had nothing to issue 46 %
+of theirs. So one vertex's shader latency matters. `nir_opt_move` puts every load right
+before its use (to save registers), so a skinning shader waits one memory latency per
+bone-matrix row, clauses running in order. Before emitting a vertex shader, each
+reorderable global load now moves, with its address arithmetic, to just before the first
+use of the load three earlier. Hoisting every load spilled and was 30–50 % slower; moving
+UBO loads too cost a UBO-only shader its 32-register fit. Result: 433a 5.45 → 5.16,
+cc66 7.90 → 7.44, d05f 7.59 → 6.76 ns/vertex; in game 32 % more triangles per GPU cycle.
+
+Tried and dropped: an SSA "sink" pass to get under 32 registers (neutral); sharing one
+address across a bone's rows (Bifrost loads have no immediate offset, so no saving); a
+branch to a check-free load when a 16-byte chunk is in bounds (clause count 41 → 71,
+slower); overlap mode (`PANVK_OVERLAP=1`) in game (no gain).
+
+**NieR loops at a loading point.** DXVK refused thousands of 4–29 MB allocations at 2 080 MB:
+it keeps a game under 80 % of the heap the driver reports, and `heap_memory_percent=0.35`
+made that 2 600 MB. With 0.42 the game moves on.
+
+**D3D12.** [`d3d12probe.c`](../tests/tools/d3d12probe.c): all VKD3D-Proton hard requirements
+present, its bindless heaps (1 M mutable update-after-bind descriptors, 2 048 samplers)
+created. [`d3d12diag.c`](../tests/tools/d3d12diag.c), a Windows program run in Winlator:
+14 draw/readback cases and presenting to a top-level and a child window pass. The AIO
+Graphics Test's D3D12 cube panel was blank on some launches while its D3D11 interface kept
+presenting into the same window; the cube shows on others. FL 11_0 only (11_1 needs 64
+storage images per stage, v7 exposes 32; 12_0 needs sparse resources).
+

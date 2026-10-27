@@ -89,7 +89,7 @@ int main(int argc, char **argv)
       for (int i = 4; i < 64; i++)
          if (sum[k][i]) {
             const char *n = name_of(k, i);
-            printf("%-5s %-32s %14llu\n", kn[k], n ? n : "?", (unsigned long long)sum[k][i]);
+            printf("%-5s %2d %-32s %14llu\n", kn[k], i, n ? n : "?", (unsigned long long)sum[k][i]);
          }
    if (with_cycles)
       printf("cycles top %llu shader %llu\n", (unsigned long long)mc.top,

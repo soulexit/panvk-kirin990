@@ -16,14 +16,14 @@ Companion repos: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kir
 
 ## At a glance
 
-| | Previous Kirin 990 Winlator pack | This driver (1.2.1-winlator) |
+| | Previous Kirin 990 Winlator pack | This driver (1.2.2-winlator) |
 |---|---|---|
 | D3D11 (AIO cube) | works | ~260–270 FPS |
 | D3D9 (AIO cube) | ~5 FPS | **~74 FPS** with the Performance emulator preset (see *Settings*) |
 | DXVK 2.x requirements (robustness2, nullDescriptor, …) | missing | all 56 hard requirements present |
 | Geometry shaders / tessellation / transform feedback | advertised but not implemented (GPU hang) | implemented (emulated), tests pass |
-| VKD3D-Proton (D3D12) | no | feature level 11_0, shader model 6.5 |
-| NieR:Automata | GPU hang on the boot screen | title screen and menu ~20 FPS; in game GPU-bound but much faster: indexed draws/s ~1 000 (1.1.0) → ~6 000, heavy batches 188/110 → ~13/8 ms |
+| VKD3D-Proton (D3D12) | no | feature level 11_0, shader model 6.5; draws, readback and presenting checked (1.2.2); AIO D3D12 cube shows |
+| NieR:Automata | GPU hang on the boot screen | title screen and menu ~20 FPS; in game GPU-bound but much faster: indexed draws/s ~1 000 (1.1.0) → ~6 000, heavy batches 188/110 → ~13/8 ms; 1.2.2: skinning vertex shaders another 10–20 % faster |
 | Winlator Renderer Driver = PanVK | black screen | **works** (1.2.1), 60 Hz |
 | Need for Speed: Most Wanted (D3D9, low) | – | 1.2.0: indexed draws/s 11 500 → 27 300, submit→done 88 → 18 ms (was ~22 FPS, GPU-bound on per-draw jobs) |
 | Vulkan CTS (dEQP-VK 1.4.7.0) | – | 94 k cases pass in a 1/10 sample of the whole suite; API/info group 18 failures of 20 k (was 610). See [docs/CTS.md](docs/CTS.md) |
@@ -36,26 +36,26 @@ Companion repos: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kir
 | SoC / GPU | Kirin 990 / Mali-G76 MC16 (Bifrost, arch v7) |
 | Android | 10 (EMUI 12), API 29, kernel 4.14.116 |
 | Kernel GPU driver | stock `mali_kbase`, JM, uAPI 11.16 (56-byte atoms) |
-| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.2.1-winlator (Mesa 26.3.0-devel)`, Vulkan 1.3.363, 165 device extensions |
+| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.2.2-winlator (Mesa 26.3.0-devel)`, Vulkan 1.3.363, 165 device extensions |
 
 Also checked on a Galaxy A51 (Exynos 9611, Mali-G72 MP3, AOSP 16, kbase uAPI 11.35):
 same build runs; all tests pass (see *Results*).
 
 ## Install
 
-1. Download `panvk-g76-kirin990-1.2.1-winlator.zip` from the
+1. Download `panvk-g76-kirin990-1.2.2-winlator.zip` from the
    [releases](https://github.com/soulexit/panvk-kirin990-winlator/releases).
 2. Winlator → **Contents** (or the AdrenoTools/driver manager) → install the zip
    (do not unzip it).
 3. In the container (or the game shortcut's settings), set the drivers as in *Settings*.
 
-Release `1.2.1-winlator` (pre-release):
+Release `1.2.2-winlator` (pre-release):
 
 ```text
-zip:     panvk-g76-kirin990-1.2.1-winlator.zip
-sha256:  7dad2e11ba197a2b8c7c5d817227ed5c2d0b54f7c75496e39b481281bb993f8a
-.so:     c2533bb183e5efec7865ef7e67447b2ef904e230fb86a75ec801a67a5c8c3f35
-source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0039 (tree cb882f2b72)
+zip:     panvk-g76-kirin990-1.2.2-winlator.zip
+sha256:  2d3b5fdd41c56d4750556693b611c84177acb4d767628b794df3aff37bc0fa18
+.so:     3fedea60ab928cf5e35c1fb8516b47d2cc778a44080a60dcb1e1454ec78772fa
+source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0041 (tree 40d8c0c9d8)
 ```
 
 Previous release `1.2.0-winlator`:
@@ -88,8 +88,8 @@ These are the settings all results below were measured with (Winlator cmod 4.1).
 
 | Setting | Value | Why |
 |---|---|---|
-| **Graphics Driver** | `PanVK G76 Kirin 990 1.2.1-winlator` | the game renders with PanVK |
-| **Renderer Driver** | **System** or `PanVK G76 Kirin 990 1.2.1-winlator` | Winlator's screen compositor. Up to 1.2.0 PanVK gave a black screen here (fixed in 1.2.1, patch 0039); System still works and keeps the compositor off PanVK. |
+| **Graphics Driver** | `PanVK G76 Kirin 990 1.2.2-winlator` | the game renders with PanVK |
+| **Renderer Driver** | **System** or `PanVK G76 Kirin 990 1.2.2-winlator` | Winlator's screen compositor. Up to 1.2.0 PanVK gave a black screen here (fixed in 1.2.1, patch 0039); System still works and keeps the compositor off PanVK. |
 | **Box64 preset** (x86_64 containers) | **Performance** | COMPATIBILITY enables `BOX64_DYNAREC_STRONGMEM=1`: every emulated memory access gets a barrier. The AIO D3D9 test spent 99 % of its CPU time in one emulated byte-swizzle loop (profiled with `simpleperf`, PanVK was 0.17 %). Performance: D3D9 12 → 60 FPS (A51), 5.5 → ~74 FPS (P40). Use COMPATIBILITY only for a game that breaks. |
 | **FEXCore preset** (ARM64EC containers) | the fastest one / TSO off | same effect as STRONGMEM above |
 | **DXVK** | DXVK-Sarek 1.11/1.12/1.14, DXVK 1.10.3, DXVK 2.3.1 all tested | DXVK 2.x needs robustness2 / null descriptors — present now |
@@ -139,6 +139,8 @@ requests linear buffers itself).
 | AIO Graphics Test, Direct3D 9 cube | 5.5 FPS (Box64 COMPATIBILITY) → **~74 FPS** (faster preset), DXVK 1.10.3 |
 | NieR:Automata (DXVK-Sarek 1.12, Proton 9 x86_64) | boots, title screen and settings menu, ~20 FPS on the title screen; no GPU faults in 3 + min |
 
+| AIO Graphics Test, Direct3D 12 cube (VKD3D-Proton 2.14.1) | shows (1.2.2) |
+
 | Test (A51, G72) | Result |
 |---|---|
 | AIO Direct3D 11 cube | 213 FPS |
@@ -173,6 +175,8 @@ requests linear buffers itself).
 | 0037 | Batched index-range helpers also take draws of up to 65 536 indices (one workgroup each) instead of three jobs per draw: 200 × 17 400 indices 158 → 66 ms (vendor 65 ms). |
 | 0038 | Robust-buffer bounds checks with one saturating subtract per 16-byte load and one compare per component (were two compares, an add and two ANDs per component): NieR skinning shaders 9–15 % faster per vertex. |
 | **0039** | **Winlator Renderer Driver = PanVK: black screen.** `vkQueueSignalReleaseImageANDROID` failed on every present (−13): PanVK copied semaphore payloads with a DRM sync-object transfer the kbase backend doesn't emulate. Off on kbase; the runtime does an empty submit instead. |
+| 0040 | Integer compare + select fused into one `CSEL` (was ICMP + MUX): 14–17 % fewer instructions in NieR's position shaders, 5–11 % faster per vertex. `BIFROST_NO_CSEL_FUSE=1` turns it off. |
+| 0041 | Vertex shaders issue storage-buffer loads up to three ahead of their use, with their address arithmetic, instead of right before it: NieR's skinning shaders 5–11 % faster per vertex (the IDVS tiler waits on each vertex's position shader). `BIFROST_NO_HOIST=1` turns it off. |
 | 0005, 0006, 0008, 0009, 0011, 0013–0018 | Diagnostics (off unless enabled in `panvk_env.txt`): swapchain pixel check, extension hiding, failed-job batch description, GPU-time profiler, wait/latency statistics. |
 
 Not in this series but required for Winlator: Android-only WSI (`-Dplatforms=android`).
@@ -208,12 +212,17 @@ swapchain and every DXVK version fails at `vkAcquireNextImageKHR`.
 
 ## Known issues / next steps
 
-- **NieR:Automata in game is GPU-bound**, mostly in vertex (position) shading of its
-  skinned meshes: per vertex ~1.0–1.3× the vendor driver's cost. Its heavy position
-  shaders need 35–40 registers, so they run at half the thread count (fitting them in
-  32 needs register-allocator work). Huawei's governor also keeps the G76 at 208–509 MHz instead
-  of 600 MHz (not changeable without root).
-- No sparse resources → VKD3D-Proton FL 12_0 titles don't start.
+- **NieR:Automata in game is GPU-bound** (~10–14 FPS at the ocean flight, 800×600). It
+  sends ~2.7 M triangles per frame of which ~2 % are visible; the tiler waits on position
+  shading for 94 % of its active time, vertex by vertex, so position-shader latency limits
+  it (register count and thread occupancy made no difference when measured). Huawei's
+  governor also keeps the G76 at 208–509 MHz instead of 600 MHz (not changeable without root).
+- **NieR needs `heap_memory_percent=0.42`** (or so) in `panvk_env.txt`: with 0.35 DXVK caps
+  it at 2 080 MB and it loops forever at a loading point. Higher values risk Android's
+  low-memory killer.
+- No sparse resources → VKD3D-Proton reports FL 11_0. Games that require 12_0/12_1 start
+  with `VKD3D_FEATURE_LEVEL=12_0` (or `12_1`) in the container's environment, as long as
+  they don't actually use tiled resources.
 - Open CTS failures (details in [docs/CTS.md](docs/CTS.md)): GPU hangs in tessellation
   with storage images in the evaluation shader and in some adjacency-primitive draws
   (geometry/tessellation emulation); update-after-bind descriptors with storage images;
@@ -237,7 +246,8 @@ the driver loads; a leading `!` overrides a variable the app already set.
 | `PANVK_OVERLAP=1` | re-enable the overlap mode (not recommended on G76) |
 | `PANVK_GRALLOC_GUESS_LINEAR=0` | refuse buffers without mapper metadata (old behaviour) |
 | `PANVK_JM_EXPORT_NOWAIT=1` | A/B only: sync-file export without waiting |
-| `heap_memory_percent=0.35` | report a smaller device heap, so DXVK keeps less memory (NieR) |
+| `heap_memory_percent=0.42` | report a smaller device heap, so DXVK keeps less memory (NieR: 0.42; at 0.35 it can't load the next area) |
+| `BIFROST_NO_CSEL_FUSE=1` / `BIFROST_NO_HOIST=1` | A/B: no compare+select fusion / vertex shader loads where nir_opt_move puts them |
 | `PANVK_V7_IDVS=0` / `PANVK_V7_BATCH_MINMAX=0` / `PANVK_V7_HOIST=0` | A/B: no IDVS / one helper job per draw / helpers in place |
 | `PANVK_V7_NO_SSBO_VEC=1` / `PANVK_V7_BRANCHY_SSBO=1` | A/B: no 16-byte merge of storage-buffer loads / guarded loads |
 | `PANVK_SSBO_VEC_LOG=1` | log per shader how many storage-buffer loads were merged |
@@ -250,7 +260,7 @@ Failed GPU jobs are always logged (`panvk: failed atom N ran: …`).
 ```bash
 export ANDROID_NDK_ROOT=/path/to/android-ndk-r30
 scripts/prepare-tree.sh work          # Mesa 5a07217f + zenithblue series + patches/
-scripts/build-android.sh work 1.2.1-winlator   # → work/dist/panvk-g76-kirin990-1.2.1-winlator.zip
+scripts/build-android.sh work 1.2.2-winlator   # → work/dist/panvk-g76-kirin990-1.2.2-winlator.zip
 scripts/build-tests.sh work           # → out/tests, out/probes
 scripts/deploy-tests.sh work/dist/libvulkan_panfrost.so
 adb shell sh /data/local/tmp/run-tests.sh /data/local/tmp/drv

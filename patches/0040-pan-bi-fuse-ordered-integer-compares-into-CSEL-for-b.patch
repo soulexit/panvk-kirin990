@@ -1,0 +1,83 @@
+From c6897a30e4f7f0c15ebd744b8b9ba94d65f2c8e9 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Tue, 27 Oct 2026 17:32:37 +0300
+Subject: [PATCH 40/41] pan/bi: fuse ordered integer compares into CSEL for
+ bcsel_pan
+
+A bcsel_pan whose condition is a 32-bit ordered integer comparison was
+emitted as ICMP + MUX. CSEL takes the comparison operands directly, so
+emit one CSEL instead; the ICMP is dead-code eliminated when it has no
+other user. Float comparisons keep the MUX, since FCMP and CSEL.f32 may
+differ on NaN; equality compares are left alone as well.
+
+Robust storage-buffer loads select every component on an unsigned
+bounds compare. In NieR:Automata's skinning vertex shaders this removes
+14-17% of the position shader instructions (cc66 354 -> 306, d05f
+389 -> 328, 433a 278 -> 230) and makes them 5-11% faster per vertex on
+a Mali-G76.
+
+BIFROST_NO_CSEL_FUSE=1 restores the old code for comparison.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../compiler/bifrost/bifrost_compile.c        | 41 ++++++++++++++++++-
+ 1 file changed, 40 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/compiler/bifrost/bifrost_compile.c b/src/panfrost/compiler/bifrost/bifrost_compile.c
+index 4c61608..a24f7d4 100644
+--- a/src/panfrost/compiler/bifrost/bifrost_compile.c
++++ b/src/panfrost/compiler/bifrost/bifrost_compile.c
+@@ -2939,10 +2939,49 @@ bi_emit_alu(bi_builder *b, nir_alu_instr *instr)
+       bi_ldexp_to(b, sz, dst, s0, s1);
+       break;
+ 
+-   case nir_op_bcsel_pan:
++   case nir_op_bcsel_pan: {
+       assert(sz <= 32);
++
++      /* CSEL compares and selects in one instruction, where a comparison
++       * feeding a MUX takes two. Robust buffer loads select every component
++       * on an ordered unsigned compare, so this matters for vertex shaders.
++       * Ordered integer compares only: float compares and CSEL may differ on
++       * NaN, and equality compares are rarely selected on.
++       */
++      nir_alu_instr *cmp = nir_src_as_alu(instr->src[0].src);
++      if (sz == 32 && comps == 1 && cmp && !getenv("BIFROST_NO_CSEL_FUSE") &&
++          nir_src_bit_size(cmp->src[0].src) == 32) {
++         nir_alu_type T = nir_type_invalid;
++
++         switch (cmp->op) {
++         case nir_op_ilt_pan:
++         case nir_op_ige_pan:
++            T = nir_type_int;
++            break;
++         case nir_op_ult_pan:
++         case nir_op_uge_pan:
++            T = nir_type_uint;
++            break;
++         default:
++            break;
++         }
++
++         if (T != nir_type_invalid) {
++            unsigned c = instr->src[0].swizzle[0];
++            nir_alu_src l = cmp->src[0], r = cmp->src[1];
++            l.swizzle[0] = cmp->src[0].swizzle[c];
++            r.swizzle[0] = cmp->src[1].swizzle[c];
++
++            bi_csel_to(b, T, sz, dst, bi_alu_src_index(b, l, 1),
++                       bi_alu_src_index(b, r, 1), s1, s2,
++                       bi_translate_cmpf(cmp->op));
++            break;
++         }
++      }
++
+       bi_mux_to(b, sz, dst, s2, s1, s0, BI_MUX_INT_ZERO);
+       break;
++   }
+ 
+    case nir_op_extract_u8:
+    case nir_op_extract_i8: {
+-- 
+2.43.0
+

@@ -1,0 +1,203 @@
+From 40d8c0c9d855500c6d8373f956ba6f32e80cec7b Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Tue, 27 Oct 2026 19:21:45 +0300
+Subject: [PATCH 41/41] pan/bi: issue vertex shader storage loads earlier
+
+nir_opt_move places every load right before its first use, so a
+skinning vertex shader alternates loading a bone matrix row, waiting for
+it and multiplying. Clauses run in order, so every row costs a memory
+latency. With IDVS the tiler waits on position shading vertex by vertex:
+in NieR:Automata on a Mali-G76 it waited 94% of its active time while
+the shader cores had nothing to issue 46% of theirs.
+
+Before emitting a vertex shader, move each reorderable global load, with
+the arithmetic its address needs, up to just before the first use of the
+load three loads earlier, so up to three are in flight while the shader
+computes. Hoisting every load spilled and was 30-50% slower, and moving
+UBO and attribute loads too cost a UBO-only shader its 32-register fit.
+
+NieR's skinning position shaders: 433a 5.45 -> 5.16, cc66 7.90 -> 7.44,
+d05f 7.59 -> 6.76 ns per vertex. BIFROST_NO_HOIST=1 disables it,
+BIFROST_HOIST_WINDOW sets the number of loads in flight.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../compiler/bifrost/bifrost_compile.c        | 155 ++++++++++++++++++
+ 1 file changed, 155 insertions(+)
+
+diff --git a/src/panfrost/compiler/bifrost/bifrost_compile.c b/src/panfrost/compiler/bifrost/bifrost_compile.c
+index a24f7d4..391806e 100644
+--- a/src/panfrost/compiler/bifrost/bifrost_compile.c
++++ b/src/panfrost/compiler/bifrost/bifrost_compile.c
+@@ -4301,6 +4301,158 @@ compare_u32(const void* a, const void* b, void* _)
+    return va - vb;
+ }
+ 
++/* Storage buffer loads only: hoisting UBO and attribute loads too cost
++ * UBO-heavy shaders their 32-register fit and was slower. */
++static bool
++bi_hoist_is_load(nir_instr *instr)
++{
++   if (instr->type != nir_instr_type_intrinsic)
++      return false;
++
++   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++   return (intr->intrinsic == nir_intrinsic_load_global ||
++           intr->intrinsic == nir_intrinsic_load_global_constant) &&
++          (nir_intrinsic_access(intr) & ACCESS_CAN_REORDER);
++}
++
++/* Collect the in-block instructions after `floor` that `instr` depends on,
++ * and instr itself. Returns false if one of them cannot move. */
++static bool bi_hoist_collect(nir_instr *instr, nir_instr *floor,
++                             struct util_dynarray *deps);
++
++struct bi_hoist_collect_state {
++   nir_instr *floor;
++   struct util_dynarray *deps;
++   bool ok;
++};
++
++static bool
++bi_hoist_collect_src(nir_src *src, void *data)
++{
++   struct bi_hoist_collect_state *st = data;
++   nir_instr *def = nir_def_instr(src->ssa);
++
++   if (def->block != st->floor->block || def->index <= st->floor->index ||
++       def->pass_flags)
++      return true;
++
++   const bool movable =
++      def->type == nir_instr_type_alu ||
++      def->type == nir_instr_type_load_const ||
++      (def->type == nir_instr_type_intrinsic &&
++       nir_intrinsic_can_reorder(nir_instr_as_intrinsic(def)));
++   if (!movable || !bi_hoist_collect(def, st->floor, st->deps)) {
++      st->ok = false;
++      return false;
++   }
++
++   return true;
++}
++
++static bool
++bi_hoist_collect(nir_instr *instr, nir_instr *floor, struct util_dynarray *deps)
++{
++   struct bi_hoist_collect_state st = {floor, deps, true};
++   instr->pass_flags = 1;
++   nir_foreach_src(instr, bi_hoist_collect_src, &st);
++   util_dynarray_append(deps, instr);
++   return st.ok;
++}
++
++static int
++bi_hoist_cmp_index(const void *a, const void *b)
++{
++   const nir_instr *x = *(nir_instr *const *)a, *y = *(nir_instr *const *)b;
++   return (int)x->index - (int)y->index;
++}
++
++/*
++ * Issue vertex shader loads earlier.
++ *
++ * nir_opt_move puts every load right before its first use to save registers,
++ * so a skinning shader alternates "load a bone matrix row, wait, multiply".
++ * Clauses run in order, so each vertex pays one memory latency per row. The
++ * IDVS tiler waits on position shading one vertex at a time (Mali-G76 in
++ * NieR:Automata: the tiler waited 94% of its active time, the shader cores
++ * idled 46% of theirs), so latency, not occupancy, limits it. Each load
++ * moves up, with the arithmetic its address needs, to just before the first
++ * use of the load `window` loads before it: that many are in flight while
++ * the shader computes, without the register pressure of hoisting them all
++ * (which spilled and was slower). NieR's skinning shaders: 6-11% faster per
++ * vertex. BIFROST_NO_HOIST=1 disables it.
++ */
++static bool
++bi_hoist_vs_loads(nir_shader *nir)
++{
++   bool progress = false;
++   const unsigned window =
++      CLAMP(debug_get_num_option("BIFROST_HOIST_WINDOW", 3), 1, 16);
++   struct util_dynarray deps;
++   util_dynarray_init(&deps, NULL);
++
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_instr *loads[16];
++         unsigned nloads = 0;
++
++         nir_foreach_instr_safe(instr, block) {
++            if (!bi_hoist_is_load(instr))
++               continue;
++
++            nir_instr *prev =
++               nloads >= window ? loads[(nloads - window) % 16] : NULL;
++            loads[nloads++ % 16] = instr;
++            if (!prev)
++               continue;
++
++            unsigned i = 0;
++            nir_foreach_instr(it, block) {
++               it->index = i++;
++               it->pass_flags = 0;
++            }
++
++            /* Not above the first use of that earlier load: up to `window`
++             * loads are then outstanding while the shader computes. */
++            nir_instr *floor = NULL;
++            nir_foreach_use(use, nir_instr_def(prev)) {
++               nir_instr *u = nir_src_use_instr(use);
++               if (u->block == block && (!floor || u->index < floor->index))
++                  floor = u;
++            }
++            if (!floor || floor->index >= instr->index)
++               continue;
++            /* The use itself stays put: move to right before it. */
++            floor = nir_instr_prev(floor);
++            if (!floor)
++               continue;
++
++            util_dynarray_clear(&deps);
++            if (!bi_hoist_collect(instr, floor, &deps))
++               continue;
++
++            nir_instr **d = util_dynarray_begin(&deps);
++            const unsigned n = util_dynarray_num_elements(&deps, nir_instr *);
++            qsort(d, n, sizeof(*d), bi_hoist_cmp_index);
++            if (d[n - 1]->index == floor->index + n)
++               continue;
++
++            nir_cursor cursor = nir_after_instr(floor);
++            for (unsigned k = 0; k < n; k++) {
++               nir_instr_move(cursor, d[k]);
++               cursor = nir_after_instr(d[k]);
++            }
++            progress = true;
++         }
++      }
++
++      nir_progress(progress, impl, nir_metadata_control_flow);
++   }
++
++   util_dynarray_fini(&deps);
++   return progress;
++}
++
++
+ static bi_context *
+ bi_compile_variant_nir(nir_shader *nir,
+                        const struct pan_compile_inputs *inputs,
+@@ -4358,6 +4510,9 @@ bi_compile_variant_nir(nir_shader *nir,
+       }
+    }
+ 
++   if (nir->info.stage == MESA_SHADER_VERTEX && !getenv("BIFROST_NO_HOIST"))
++      NIR_PASS(_, nir, bi_hoist_vs_loads);
++
+    /* If nothing is pushed, all UBOs need to be uploaded */
+    ctx->ubo_mask = ~0;
+ 
+-- 
+2.43.0
+
