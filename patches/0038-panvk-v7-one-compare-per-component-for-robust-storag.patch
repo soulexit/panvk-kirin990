@@ -1,0 +1,81 @@
+From 5e7df5eda668113f5457e45df2f1e7084a2de272 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Tue, 27 Oct 2026 14:41:01 +0300
+Subject: [PATCH 38/39] panvk/v7: one compare per component for robust storage
+ buffer loads
+
+The bounds check of a bounded load (bound >= size && bound - size >=
+offset) took two compares, an add and an AND per load, and the merged
+16-byte loads added a group check to every member. NieR:Automata's skinning
+position shaders spent more instructions on these checks than on the
+skinning.
+
+usub_sat (IADD.sat on Bifrost) gives the bytes left from the offset in one
+instruction: a load fits when left >= size, a member of a merged load when
+left >= 4 * (lane + components), with one subtract per group. Same results,
+including offsets that wrap around 2^32.
+
+NieR's largest position shader: 485 -> 389 instructions; replayed on the
+G76, 9.8 -> 8.4 ns per vertex (vendor driver 6.0-8.5 ns).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_vX_shader.c | 28 +++++++++++++++------------
+ 1 file changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index d430afa..57644fa 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -488,8 +488,9 @@ panvk_lower_bounded_load(nir_builder *b, nir_intrinsic_instr *intr,
+    nir_def *offset = intr->src[1].ssa;
+    nir_def *bound = intr->src[2].ssa;
+ 
+-   nir_def *fits = nir_iand(b, nir_uge_imm(b, bound, size),
+-                            nir_uge(b, nir_iadd_imm(b, bound, -size), offset));
++   /* bound >= offset + size, without overflow: one saturating subtract and
++    * one compare (Bifrost has IADD.sat). */
++   nir_def *fits = nir_uge_imm(b, nir_usub_sat(b, bound, offset), size);
+    nir_def *safe_offset = nir_bcsel(b, fits, offset, nir_imm_int(b, 0));
+    nir_def *addr = nir_iadd(b, base, nir_u2u64(b, safe_offset));
+    /* Offset 0 keeps the load's alignment; storage buffer descriptors are
+@@ -728,8 +729,14 @@ panvk_vectorize_bounded_loads(nir_shader *nir)
+             nir_def *x = nir_imm_int(&b, cs[i].chunk);
+             if (cs[i].x.def)
+                x = nir_iadd(&b, nir_imul_imm(&b, nir_mov_scalar(&b, cs[i].x), cs[i].mul), x);
+-            nir_def *any_fits = nir_iand(&b, nir_uge_imm(&b, bound, 4),
+-                                         nir_uge(&b, nir_iadd_imm(&b, bound, -4), x));
++            /* Bytes left in the buffer from x: member lanes [l, l + n) are
++             * in bounds exactly when left >= 4 * (l + n). One saturating
++             * subtract per group and one compare per member, instead of
++             * two compares, an add and two ANDs per member: NieR's
++             * skinning shaders spent more instructions on bounds checks
++             * than on the skinning, and needed more than 32 registers. */
++            nir_def *left = nir_usub_sat(&b, bound, x);
++            nir_def *any_fits = nir_uge_imm(&b, left, 4);
+             nir_def *addr = nir_iadd(&b, first->src[0].ssa,
+                                      nir_u2u64(&b, nir_bcsel(&b, any_fits, x,
+                                                              nir_imm_int(&b, 0))));
+@@ -743,14 +750,11 @@ panvk_vectorize_bounded_loads(nir_shader *nir)
+                nir_intrinsic_instr *intr = cs[j].intr;
+                const unsigned comps = intr->def.num_components;
+                b.cursor = nir_before_instr(&intr->instr);
+-               nir_def *offset = intr->src[1].ssa;
+-               nir_def *mbound = intr->src[2].ssa;
+-               nir_def *fits = nir_iand(&b, nir_uge_imm(&b, mbound, comps * 4),
+-                                        nir_uge(&b, nir_iadd_imm(&b, mbound, -(int)(comps * 4)),
+-                                                offset));
+-               /* any_fits: the vector was read at x (false only if an
+-                * offset wrapped around 2^32 back into the buffer). */
+-               fits = nir_iand(&b, fits, any_fits);
++               /* Members are at x + 4 * lane exactly (mod 2^32); an offset
++                * that wrapped around back into the buffer reads 0, as the
++                * vector was not read there. */
++               nir_def *fits =
++                  nir_uge_imm(&b, left, 4 * (cs[j].lane + comps));
+                nir_def *val = nir_channels(&b, vec, BITFIELD_RANGE(cs[j].lane, comps));
+                nir_def_replace(&intr->def,
+                                nir_bcsel(&b, fits, val, nir_imm_zero(&b, comps, 32)));
+-- 
+2.43.0
+

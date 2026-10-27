@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.1-winlator (testing) — 2026-10-27
+
+- **Renderer Driver = PanVK works** (Winlator's own Vulkan compositor): every present
+  failed in `vkQueueSignalReleaseImageANDROID` (−13), because PanVK copied semaphore
+  state with a DRM sync-object operation the kbase backend can't do. The compositor
+  showed a black screen and recreated its swapchain ~40×/s. Now 60 presents/s,
+  0.76 ms of GPU time per frame. Renderer Driver = System is no longer required.
+- **Large indexed draws batched too** (up to 65 536 indices): 200 draws × 17 400
+  indices 158 → 66 ms on the draw benchmark (vendor driver 65 ms). NieR:Automata:
+  large vertex/tiler batches 12–17 % faster.
+- **Cheaper robust-buffer bounds checks** (one saturating subtract per 16-byte load,
+  one compare per component): NieR's skinning vertex shaders 9–15 % faster per vertex.
+- Tools: `tests/tools/anbprobe.c` (Android present path), `tests/tools/spvcomp/`
+  (compile and benchmark captured game shaders on the PC and the phone).
+
 ## 1.2.0-winlator (testing) — 2026-10-27
 
 Performance in games, measured with Mali hardware counters (see

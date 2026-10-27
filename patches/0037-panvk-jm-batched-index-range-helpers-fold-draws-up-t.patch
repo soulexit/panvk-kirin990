@@ -1,0 +1,61 @@
+From 28d3e409d89ab004579723bdc043adadd19ddb3e Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Tue, 27 Oct 2026 14:05:49 +0300
+Subject: [PATCH 37/39] panvk/jm: batched index range helpers fold draws up to
+ 65536 indices
+
+A draw of more than 4096 indices still got a WRITE_VALUE, a strided search
+and its own helper job. In the batched helper it is one workgroup among the
+batch's others, which run in parallel on all shader cores, so draws of up
+to 65536 indices (64 lanes of up to 1024 indices) fold too.
+
+200 indexed draws x 17,400 indices: 158 -> 66 ms per frame (vendor driver
+65 ms). NieR:Automata: draws on the batched helper 3,400 -> 5,250 per
+second, large vertex/tiler batches 16.2/9.3 -> 13.4/8.2 ms, submit-to-done
+137 -> 117 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index ee177ee..9575d2a 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -3338,11 +3338,6 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+       const char *e = getenv("PANVK_V7_MINMAX");
+       minmax_mode = !e ? 2 : !strcmp(e, "0") ? 0 : !strcmp(e, "nofold") ? 1 : 2;
+    }
+-#define PANVK_V7_MINMAX_FOLD_MAX 4096
+-   const bool fold_minmax = minmax_mode == 2 && draw->info.index.index_size &&
+-                            draw->cpu_count &&
+-                            draw->cpu_count <= PANVK_V7_MINMAX_FOLD_MAX &&
+-                            !vs->info.writes_global;
+ 
+    /* Index range helpers recorded to the head of the batch (see
+     * panvk_jc_add_hoisted()). Not when the vertex shader writes memory (its
+@@ -3369,6 +3364,20 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+    const bool batch_minmax = batch_minmax_knob;
+    bool batched_helper = false;
+ 
++#define PANVK_V7_MINMAX_FOLD_MAX 4096
++   /* A batched helper is one workgroup among the batch's others, which run
++    * in parallel on all shader cores, so a larger draw folds too: 64 lanes
++    * of up to 1024 indices instead of a WRITE_VALUE, a search and a helper
++    * job (NieR:Automata: ~2,300 draws/s of ~17,000 indices).
++    */
++#define PANVK_V7_MINMAX_BATCH_FOLD_MAX 65536
++   const uint32_t fold_max = hoist && batch_minmax
++                                ? PANVK_V7_MINMAX_BATCH_FOLD_MAX
++                                : PANVK_V7_MINMAX_FOLD_MAX;
++   const bool fold_minmax = minmax_mode == 2 && draw->info.index.index_size &&
++                            draw->cpu_count && draw->cpu_count <= fold_max &&
++                            !vs->info.writes_global;
++
+    if (draw->info.index.index_size) {
+       const unsigned path =
+          vs->info.writes_global                     ? 2
+-- 
+2.43.0
+

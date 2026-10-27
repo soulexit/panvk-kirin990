@@ -1,0 +1,44 @@
+From cb882f2b7275f538279e009b94493ba3ceaec8ee Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Tue, 27 Oct 2026 15:01:10 +0300
+Subject: [PATCH 39/39] panvk: no sync object payload copy on kbase
+
+kbase emulates DRM sync objects without SYNCOBJ_TRANSFER, so
+vk_drm_syncobj_copy_payloads() always failed with VK_ERROR_UNKNOWN. The
+Android runtime uses it in vkQueueSignalReleaseImageANDROID, called for
+every present through the Android swapchain: Winlator's Vulkan compositor
+("Renderer Driver" = PanVK) failed all 4,418 presents of a 20 s run,
+recreated its swapchain ~40 times a second and showed a black screen.
+
+On kbase, leave copy_sync_payloads unset: the runtime then does an empty
+submit that waits on the frame and signals the exportable semaphore.
+Winlator's compositor now presents at 60 Hz, 0.76 ms of GPU time a frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_vX_device.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index 4c15eff..acd32a7 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -738,6 +738,15 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
+    device->vk.check_status = panvk_device_check_status;
+    device->vk.get_timestamp = panvk_device_get_timestamp;
+    device->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
++#ifdef HAVE_PAN_KMOD_KBASE
++   /* kbase emulates sync objects without SYNCOBJ_TRANSFER, so copying
++    * payloads always failed with VK_ERROR_UNKNOWN. vkQueueSignalReleaseImage-
++    * ANDROID (every present of an app using the Android swapchain on PanVK,
++    * e.g. Winlator's compositor as Renderer Driver: black screen) took that
++    * path; without it the runtime does an empty submit instead. */
++   if (physical_device->kbase_node_path[0])
++      device->vk.copy_sync_payloads = NULL;
++#endif
+ 
+    device->kmod.allocator = (struct pan_kmod_allocator){
+       .zalloc = panvk_kmod_zalloc,
+-- 
+2.43.0
+

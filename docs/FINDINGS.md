@@ -118,5 +118,33 @@ shader could read descriptor tables before they were copied. Bisected by build, 
 switch (`PANVK_V7_HOIST=0` passes), then confirmed with a barrier and with an explicit
 dependency. The vertex and IDVS jobs now depend on the copy job directly.
 
-Next: NieR's vertex shading (position shading still dominates); the Renderer-Driver
-compositor fault.
+## 7. 1.2.1: large draws, NieR's shaders, the Renderer Driver
+
+**Large indexed draws.** After 1.2.0 about 2 300 of NieR's ~5 900 indexed draws per
+second still had more than 4 096 indices and took three jobs each (WRITE_VALUE, search,
+helper). Batched helpers now fold draws of up to 65 536 indices (0037): 200 × 17 400
+indices 158 → 66 ms on the benchmark, vendor 65 ms; in game 12–17 % off the large batches.
+
+**NieR's vertex shaders, replayed.** One capture run with `MESA_SPIRV_DUMP_PATH` and
+`BIFROST_MESA_DEBUG=shaderdb` gave all 128 shaders. [`tests/tools/spvcomp`](../tests/tools/spvcomp/)
+compiles a captured vertex shader on a host drm-shim G76 build (same numbers as in game)
+and benchmarks it on the phone with zeroed buffers (position shading + culling), on
+PanVK and on the vendor driver:
+- 14 of 42 position shaders run at half occupancy (35–40 registers); load/store-bound.
+- The disassembly had more integer compare/select than FMA: bounds checks. 0038 makes them
+  one saturating subtract per 16-byte load and one compare per component: 485 → 389
+  instructions, 9–15 % less time per vertex (largest: 9.8 → 8.4 ns, vendor 6.0–8.5 ns).
+- Tried and dropped: pushing UBO ranges into the FAU (compiler supports it, PanVK
+  doesn't; ceiling measured with unfilled data only 4–11 % per vertex, needs a GPU copy
+  job); spilling to 32 registers (the spiller can't split 4-register vector nodes).
+
+**Renderer Driver = PanVK.** Logged with `PANVK_G76_DIAG=1`: the game's frames reached the
+compositor with content, but every `vkQueueSignalReleaseImageANDROID` failed (−13), and
+every one of the compositor's GPU jobs came back terminated (event 0x4) while it recreated
+its swapchain ~40×/s. Reproduced outside Winlator with
+[`tests/tools/anbprobe.c`](../tests/tools/anbprobe.c): the runtime copied semaphore
+payloads with `vk_drm_syncobj_copy_payloads`, i.e. `SYNCOBJ_TRANSFER`, which the kbase
+sync-object emulation does not have. 0039 turns that path off on kbase. Then: 60 presents/s,
+0.76 ms of GPU per frame, no failed jobs — the terminated jobs were a side effect.
+
+Next: register pressure of NieR's position shaders.
