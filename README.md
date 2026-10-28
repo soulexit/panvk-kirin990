@@ -1,6 +1,6 @@
 # panvk-kirin990-winlator
 
-Mesa **PanVK** Vulkan driver for **Winlator** on the Huawei P40 / Kirin 990
+Mesa **PanVK** Vulkan driver for **Winlator** and **Eden** (Switch emulator) on the Huawei P40 / Kirin 990
 (**Mali-G76 MC16**), running on the phone's stock `mali_kbase` (JM) kernel driver
 — no root, no custom kernel.
 
@@ -16,7 +16,7 @@ Companion repos: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kir
 
 ## At a glance
 
-| | Previous Kirin 990 Winlator pack | This driver (1.2.2-winlator) |
+| | Previous Kirin 990 Winlator pack | This driver (1.2.3) |
 |---|---|---|
 | D3D11 (AIO cube) | works | ~260–270 FPS |
 | D3D9 (AIO cube) | ~5 FPS | **~74 FPS** with the Performance emulator preset (see *Settings*) |
@@ -24,6 +24,7 @@ Companion repos: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kir
 | Geometry shaders / tessellation / transform feedback | advertised but not implemented (GPU hang) | implemented (emulated), tests pass |
 | VKD3D-Proton (D3D12) | no | feature level 11_0, shader model 6.5; draws, readback and presenting checked (1.2.2); AIO D3D12 cube shows |
 | NieR:Automata | GPU hang on the boot screen | title screen and menu ~20 FPS; in game GPU-bound but much faster: indexed draws/s ~1 000 (1.1.0) → ~6 000, heavy batches 188/110 → ~13/8 ms; 1.2.2: skinning vertex shaders another 10–20 % faster |
+| Eden (Switch emulator) | – | **runs** (1.2.3): NieR:Automata (crashed before), Zelda: Echoes of Wisdom 16–20 FPS with Huawei's performance mode |
 | Winlator Renderer Driver = PanVK | black screen | **works** (1.2.1), 60 Hz |
 | Need for Speed: Most Wanted (D3D9, low) | – | 1.2.0: indexed draws/s 11 500 → 27 300, submit→done 88 → 18 ms (was ~22 FPS, GPU-bound on per-draw jobs) |
 | Vulkan CTS (dEQP-VK 1.4.7.0) | – | 94 k cases pass in a 1/10 sample of the whole suite; API/info group 18 failures of 20 k (was 610). See [docs/CTS.md](docs/CTS.md) |
@@ -36,20 +37,34 @@ Companion repos: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kir
 | SoC / GPU | Kirin 990 / Mali-G76 MC16 (Bifrost, arch v7) |
 | Android | 10 (EMUI 12), API 29, kernel 4.14.116 |
 | Kernel GPU driver | stock `mali_kbase`, JM, uAPI 11.16 (56-byte atoms) |
-| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.2.2-winlator (Mesa 26.3.0-devel)`, Vulkan 1.3.363, 165 device extensions |
+| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.2.3 (Mesa 26.3.0-devel)`, Vulkan 1.3.363, 165 device extensions |
 
 Also checked on a Galaxy A51 (Exynos 9611, Mali-G72 MP3, AOSP 16, kbase uAPI 11.35):
 same build runs; all tests pass (see *Results*).
 
 ## Install
 
-1. Download `panvk-g76-kirin990-1.2.2-winlator.zip` from the
-   [releases](https://github.com/soulexit/panvk-kirin990-winlator/releases).
-2. Winlator → **Contents** (or the AdrenoTools/driver manager) → install the zip
-   (do not unzip it).
-3. In the container (or the game shortcut's settings), set the drivers as in *Settings*.
+Download `panvk-g76-kirin990-1.2.3.zip` from the
+[releases](https://github.com/soulexit/panvk-kirin990-winlator/releases). The same zip
+works in every app that loads AdrenoTools drivers; do not unzip it.
 
-Release `1.2.2-winlator` (pre-release):
+- **Winlator:** **Contents** (or the driver manager) → install the zip; in the container
+  (or the game shortcut's settings) set the drivers as in *Settings*.
+- **Eden:** Settings → GPU driver manager → install the zip, select it (globally or per
+  game). Optional driver options go in
+  `/sdcard/Android/data/dev.legacy.eden_emulator.nightly/files/panvk_env.txt` (Eden can't
+  read `/sdcard/Download`).
+
+Release `1.2.3` (pre-release; from 1.2.3 on, versions have no `-winlator` suffix):
+
+```text
+zip:     panvk-g76-kirin990-1.2.3.zip
+sha256:  44cd4bc4785ab788219e73e17fbef3f9b6351d9a90ec2e71264ac56aa830825b
+.so:     8ad6819c0f8b7099e1a0119d86aa4fb21756340026f7aa12fe46ce507a49aefa
+source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0045 (tree e53ed5c178)
+```
+
+Previous release `1.2.2-winlator`:
 
 ```text
 zip:     panvk-g76-kirin990-1.2.2-winlator.zip
@@ -79,7 +94,7 @@ sha256:  2123e49b8958230d89930c03dbc971fa2b2285f1e1ecbcfc76d387be73cdb728
 source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0018 (tree 60571fd11b)
 ```
 
-The zip is a standard AdrenoTools package: one stripped `libvulkan_panfrost.so`
+The zip is a standard AdrenoTools package: one `libvulkan_panfrost.so`
 (static libc++, no other libraries) and `meta.json` (`minApi` 29).
 
 ## Settings (Winlator / DXVK)
@@ -88,8 +103,8 @@ These are the settings all results below were measured with (Winlator cmod 4.1).
 
 | Setting | Value | Why |
 |---|---|---|
-| **Graphics Driver** | `PanVK G76 Kirin 990 1.2.2-winlator` | the game renders with PanVK |
-| **Renderer Driver** | **System** or `PanVK G76 Kirin 990 1.2.2-winlator` | Winlator's screen compositor. Up to 1.2.0 PanVK gave a black screen here (fixed in 1.2.1, patch 0039); System still works and keeps the compositor off PanVK. |
+| **Graphics Driver** | `PanVK G76 Kirin 990 1.2.3` | the game renders with PanVK |
+| **Renderer Driver** | **System** or `PanVK G76 Kirin 990 1.2.3` | Winlator's screen compositor. Up to 1.2.0 PanVK gave a black screen here (fixed in 1.2.1, patch 0039); System still works and keeps the compositor off PanVK. |
 | **Box64 preset** (x86_64 containers) | **Performance** | COMPATIBILITY enables `BOX64_DYNAREC_STRONGMEM=1`: every emulated memory access gets a barrier. The AIO D3D9 test spent 99 % of its CPU time in one emulated byte-swizzle loop (profiled with `simpleperf`, PanVK was 0.17 %). Performance: D3D9 12 → 60 FPS (A51), 5.5 → ~74 FPS (P40). Use COMPATIBILITY only for a game that breaks. |
 | **FEXCore preset** (ARM64EC containers) | the fastest one / TSO off | same effect as STRONGMEM above |
 | **DXVK** | DXVK-Sarek 1.11/1.12/1.14, DXVK 1.10.3, DXVK 2.3.1 all tested | DXVK 2.x needs robustness2 / null descriptors — present now |
@@ -98,7 +113,8 @@ These are the settings all results below were measured with (Winlator cmod 4.1).
 | Present mode | default (FIFO/mailbox) | no measurable difference on NieR |
 
 Optional driver options can be set without rebuilding through a text file read at
-driver load, `/sdcard/Download/panvk_env.txt` (see *Diagnostics*). Leave it absent or
+driver load, `/sdcard/Download/panvk_env.txt`, or for apps without storage access (Eden)
+`/sdcard/Android/data/<package>/files/panvk_env.txt` (see *Diagnostics*). Leave it absent or
 empty for normal use.
 
 ## Results
@@ -141,6 +157,13 @@ requests linear buffers itself).
 
 | AIO Graphics Test, Direct3D 12 cube (VKD3D-Proton 2.14.1) | shows (1.2.2) |
 
+### Eden (Switch emulator, 1.2.3)
+
+| Test (P40) | Result |
+|---|---|
+| NieR:Automata – The End of YoRHa Edition | runs without crashing (1.2.2: GPU context fault in a 1024-invocation compute shader, fixed by 0044) |
+| Zelda: Echoes of Wisdom | 8–12 FPS in cutscenes, 16–20 FPS with Huawei's performance mode; 2D menu smooth. GPU-bound on ~85 render passes per frame; some stutter |
+
 | Test (A51, G72) | Result |
 |---|---|
 | AIO Direct3D 11 cube | 213 FPS |
@@ -177,6 +200,10 @@ requests linear buffers itself).
 | **0039** | **Winlator Renderer Driver = PanVK: black screen.** `vkQueueSignalReleaseImageANDROID` failed on every present (−13): PanVK copied semaphore payloads with a DRM sync-object transfer the kbase backend doesn't emulate. Off on kbase; the runtime does an empty submit instead. |
 | 0040 | Integer compare + select fused into one `CSEL` (was ICMP + MUX): 14–17 % fewer instructions in NieR's position shaders, 5–11 % faster per vertex. `BIFROST_NO_CSEL_FUSE=1` turns it off. |
 | 0041 | Vertex shaders issue storage-buffer loads up to three ahead of their use, with their address arithmetic, instead of right before it: NieR's skinning shaders 5–11 % faster per vertex (the IDVS tiler waits on each vertex's position shader). `BIFROST_NO_HOIST=1` turns it off. |
+| 0042 | **Eden crash in `vkCmdClearAttachments`**: push-descriptor storage was sized in API descriptors, but a combined image sampler takes up to 5 hardware descriptors → the meta clear overwrote memory. Sized in hardware descriptors now. |
+| 0043 | Barriers with nothing to wait for (destination stage only TOP_OF_PIPE, or source only BOTTOM_OF_PIPE) no longer end the batch. `panvk_env.txt` is also read from `/sdcard/Android/data/<package>/files/`. Profiler: why batches were split, slow shader compiles. |
+| **0044** | **Eden NieR:Automata crash**: the large-workgroup split (0012) refused shaders with subgroup operations, so 1024-invocation workgroups ran unsplit on the G76 (wrong results, then a GPU fault). `gl_SubgroupID` / `gl_NumSubgroups` are now rewritten per logical invocation and such shaders are split. |
+| 0045 | Profiler: on the first failed GPU job, log the last 128 jobs (kind, duration, result). |
 | 0005, 0006, 0008, 0009, 0011, 0013–0018 | Diagnostics (off unless enabled in `panvk_env.txt`): swapchain pixel check, extension hiding, failed-job batch description, GPU-time profiler, wait/latency statistics. |
 
 Not in this series but required for Winlator: Android-only WSI (`-Dplatforms=android`).
@@ -212,6 +239,12 @@ swapchain and every DXVK version fails at `vkAcquireNextImageKHR`.
 
 ## Known issues / next steps
 
+- **Eden: Zelda: Echoes of Wisdom is GPU-bound** (16–20 FPS): the emulator issues ~85 render
+  passes per frame, three quarters with one draw, and each pass loads and stores its tiles.
+  Passes on the same target can't be merged (they are feedback loops: the next pass samples
+  what the previous one drew). Folding clear-only passes into the next pass might gain 5–10 %.
+- A 256-invocation compute shader with a barrier inside control flow still runs unsplit
+  (the split needs top-level barriers); no game is known to break on it.
 - **NieR:Automata in game is GPU-bound** (~10–14 FPS at the ocean flight, 800×600). It
   sends ~2.7 M triangles per frame of which ~2 % are visible; the tiler waits on position
   shading for 94 % of its active time, vertex by vertex, so position-shader latency limits
@@ -232,14 +265,16 @@ swapchain and every DXVK version fails at `vkAcquireNextImageKHR`.
 
 Full investigation log: [docs/FINDINGS.md](docs/FINDINGS.md).
 
-## Diagnostics (`/sdcard/Download/panvk_env.txt`)
+## Diagnostics (`panvk_env.txt`)
 
-`KEY=VALUE` lines (only `PANVK_*`, `PAN_*`, `MESA_*`, `BIFROST_*` and `heap_memory_percent`) are put in the environment when
+The file is `/sdcard/Download/panvk_env.txt`; when the app can't read it,
+`/sdcard/Android/data/<package>/files/panvk_env.txt`. `KEY=VALUE` lines (only `PANVK_*`, `PAN_*`, `MESA_*`, `BIFROST_*` and `heap_memory_percent`) are put in the environment when
 the driver loads; a leading `!` overrides a variable the app already set.
 
 | Option | Effect |
 |---|---|
-| `PANVK_GPU_PROF=1` | logcat every 5 s: GPU time per kind of batch, CPU wait time, submit rate, submit→done latency |
+| `PANVK_GPU_PROF=1` | logcat every 5 s: GPU time per kind of batch, CPU wait time, submit rate, submit→done latency, batches/s and why they were split, shader compiles over 5 ms; on the first failed job the last 128 jobs (`HIST`) |
+| `PANVK_SPLIT_NOOP_BARRIERS=1` | A/B: no-op barriers end the batch again (before 1.2.3) |
 | `PANVK_G76_DIAG=1` | log whether the imported swapchain buffers contain non-black pixels |
 | `PANVK_HIDE_EXTS=VK_EXT_a,VK_KHR_b` | hide device extensions |
 | `MESA_SPIRV_DUMP_PATH=/sdcard/Download/spv` + `!MESA_SHADER_CACHE_DISABLE=true` | dump every SPIR-V shader (named by hash; failed jobs log the hash) |
@@ -260,7 +295,7 @@ Failed GPU jobs are always logged (`panvk: failed atom N ran: …`).
 ```bash
 export ANDROID_NDK_ROOT=/path/to/android-ndk-r30
 scripts/prepare-tree.sh work          # Mesa 5a07217f + zenithblue series + patches/
-scripts/build-android.sh work 1.2.2-winlator   # → work/dist/panvk-g76-kirin990-1.2.2-winlator.zip
+scripts/build-android.sh work 1.2.3   # → work/dist/panvk-g76-kirin990-1.2.3.zip
 scripts/build-tests.sh work           # → out/tests, out/probes
 scripts/deploy-tests.sh work/dist/libvulkan_panfrost.so
 adb shell sh /data/local/tmp/run-tests.sh /data/local/tmp/drv
@@ -276,7 +311,10 @@ check), `tests/tools/hwcnt.c` (Mali-G76 hardware counters, no root),
 driver as an ICD, for comparisons), `tests/tools/anbprobe.c` (Android present path:
 `vkQueueSignalReleaseImageANDROID`), `tests/tools/spvcomp/` (compile a shader captured
 with `MESA_SPIRV_DUMP_PATH` on a host drm-shim build, or benchmark it on the phone
-against the vendor driver).
+against the vendor driver; compute mode with `SPVCOMP_FILL` / `SPVCOMP_GROUPS`),
+`tests/tools/lwgtest/` (1024-invocation workgroup with subgroup operations, shared memory
+and barriers), `tests/tools/gsreplay/` (geometry-shader emulation replay),
+`tests/tools/fmtprobe.c` (format feature dump).
 
 Host requirements: meson, ninja, python3 (mako, pyyaml), LLVM + clang + libclc +
 SPIRV-LLVM-Translator (for Mesa's host code generators), glslang, xxd.

@@ -195,6 +195,112 @@ bench(VkPhysicalDevice pd, PFN_vkVoidFunction gmp_, PFN_vkGetDeviceProcAddr gdpa
           best * 1e6 / nv);
 }
 
+/* Compute mode: one zeroed 8 MiB buffer behind every binding, dispatch
+ * SPVCOMP_GROUPS (default 3) workgroups, wait up to 10 s. */
+static int
+run_compute(VkPhysicalDevice pd, PFN_vkVoidFunction gmp_, PFN_vkGetDeviceProcAddr gdpa,
+            VkPipelineLayout pl, VkDescriptorSetLayout dsl, const struct binding *binds,
+            int nbinds, const uint32_t *spv, size_t nw)
+{
+   PFN_vkGetPhysicalDeviceMemoryProperties gmp = (PFN_vkGetPhysicalDeviceMemoryProperties)gmp_;
+   D(vkCreateShaderModule); D(vkCreateComputePipelines); D(vkCreateBuffer);
+   D(vkGetBufferMemoryRequirements); D(vkAllocateMemory); D(vkBindBufferMemory); D(vkMapMemory);
+   D(vkCreateDescriptorPool); D(vkAllocateDescriptorSets); D(vkUpdateDescriptorSets);
+   D(vkCreateBufferView); D(vkCreateCommandPool); D(vkAllocateCommandBuffers);
+   D(vkBeginCommandBuffer); D(vkEndCommandBuffer); D(vkCmdBindPipeline);
+   D(vkCmdBindDescriptorSets); D(vkCmdDispatch); D(vkQueueSubmit); D(vkGetDeviceQueue);
+   D(vkCreateFence); D(vkWaitForFences);
+   VkShaderModuleCreateInfo smi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nw * 4,
+                                   .pCode = spv};
+   VkShaderModule sm; CK(vkCreateShaderModule(dev, &smi, NULL, &sm));
+   VkComputePipelineCreateInfo cpi = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                .module = sm, .pName = "main"}, .layout = pl};
+   VkPipeline pipe;
+   double t0 = now_ms();
+   CK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, &pipe));
+   printf("compute pipeline compiled in %.1f ms\n", now_ms() - t0);
+
+   VkPhysicalDeviceMemoryProperties mp; gmp(pd, &mp);
+   const VkDeviceSize bsize = 8 << 20;
+   VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bsize,
+      .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+               VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT};
+   VkBuffer buf; CK(vkCreateBuffer(dev, &bci, NULL, &buf));
+   VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, buf, &mr);
+   uint32_t ti = 0;
+   const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   while (!(mr.memoryTypeBits & (1u << ti)) || (mp.memoryTypes[ti].propertyFlags & want) != want) ti++;
+   VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+                               .memoryTypeIndex = ti};
+   VkDeviceMemory mem; CK(vkAllocateMemory(dev, &mai, NULL, &mem));
+   CK(vkBindBufferMemory(dev, buf, mem, 0));
+   void *map; CK(vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, &map));
+   memset(map, 0, bsize);
+   if (getenv("SPVCOMP_FILL")) {
+      /* hex word, or "rand" for pseudo-random words */
+      const char *fv = getenv("SPVCOMP_FILL");
+      uint32_t x = 12345, v = (uint32_t)strtoul(fv, NULL, 16);
+      for (size_t i = 0; i < bsize / 4; i++) {
+         x = x * 1103515245u + 12345u;
+         ((uint32_t *)map)[i] = strcmp(fv, "rand") ? v : x;
+      }
+   }
+   VkDescriptorPoolSize ps[4] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 64},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64}, {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 64},
+      {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 64}};
+   VkDescriptorPoolCreateInfo dpi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1,
+                                     .poolSizeCount = 4, .pPoolSizes = ps};
+   VkDescriptorPool dp; CK(vkCreateDescriptorPool(dev, &dpi, NULL, &dp));
+   VkDescriptorSetAllocateInfo dsa = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+      .descriptorPool = dp, .descriptorSetCount = 1, .pSetLayouts = &dsl};
+   VkDescriptorSet set; CK(vkAllocateDescriptorSets(dev, &dsa, &set));
+   for (int i = 0; i < nbinds; i++) {
+      VkDescriptorBufferInfo dbi = {buf, 0, binds[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? 65536 : (4 << 20)};
+      VkBufferView bv = VK_NULL_HANDLE;
+      VkWriteDescriptorSet wds = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+         .dstBinding = binds[i].binding, .descriptorCount = 1, .descriptorType = binds[i].type};
+      if (binds[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+          binds[i].type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+         wds.pBufferInfo = &dbi;
+      } else if (binds[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+                 binds[i].type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+         VkBufferViewCreateInfo bvi = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = buf,
+            .format = VK_FORMAT_R32_UINT, .range = 1 << 20};
+         CK(vkCreateBufferView(dev, &bvi, NULL, &bv));
+         wds.pTexelBufferView = &bv;
+      } else {
+         printf("compute: binding %d type %d not supported\n", binds[i].binding, binds[i].type);
+         return 1;
+      }
+      vkUpdateDescriptorSets(dev, 1, &wds, 0, NULL);
+   }
+   VkQueue q; vkGetDeviceQueue(dev, 0, 0, &q);
+   VkCommandPoolCreateInfo cpci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+   VkCommandPool cp; CK(vkCreateCommandPool(dev, &cpci, NULL, &cp));
+   VkCommandBufferAllocateInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                      .commandPool = cp, .commandBufferCount = 1};
+   VkCommandBuffer cb; CK(vkAllocateCommandBuffers(dev, &cbi, &cb));
+   VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+   CK(vkBeginCommandBuffer(cb, &bi));
+   vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+   vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, NULL);
+   const uint32_t groups = getenv("SPVCOMP_GROUPS") ? atoi(getenv("SPVCOMP_GROUPS")) : 3;
+   vkCmdDispatch(cb, groups, 1, 1);
+   CK(vkEndCommandBuffer(cb));
+   VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+   VkFence fence; CK(vkCreateFence(dev, &fci, NULL, &fence));
+   VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+   t0 = now_ms();
+   CK(vkQueueSubmit(q, 1, &si, fence));
+   VkResult r = vkWaitForFences(dev, 1, &fence, VK_TRUE, 10000000000ull);
+   printf("dispatch %u groups: %s after %.1f ms\n", groups,
+          r == VK_SUCCESS ? "done" : r == VK_TIMEOUT ? "TIMEOUT" : "ERROR", now_ms() - t0);
+   if (r) printf("FAIL wait %d\n", r);
+   else printf("PASS\n");
+   return r ? 1 : 0;
+}
+
 int main(int argc, char **argv)
 {
    if (argc < 3) { printf("usage: spvcomp icd.so shader.vert.spv [frag.spv]\n"); return 2; }
@@ -204,10 +310,13 @@ int main(int argc, char **argv)
 
    /* Pass 1: decorations, types, variables. */
    struct { uint32_t id, type, sc; } vars[512]; int nvars = 0;
+   int is_cs = 0;
    for (size_t p = 5; p < nw;) {
       const uint32_t op = w[p] & 0xffff, len = w[p] >> 16;
       const uint32_t *a = &w[p + 1];
       if (!len) break;
+      if (op == 15 /* OpEntryPoint */ && a[0] == 5 /* GLCompute */)
+         is_cs = 1;
       if (op == 71 /* OpDecorate */) {
          if (a[1] == 34) set_of[a[0]] = a[2];
          else if (a[1] == 33) binding_of[a[0]] = a[2];
@@ -316,7 +425,8 @@ int main(int argc, char **argv)
 
    size_t fw = 0;
    uint32_t *fspv = NULL;
-   if (argc > 3) {
+   if (is_cs) {
+   } else if (argc > 3) {
       fspv = load(argv[3], &fw);
    } else {
       FILE *f = fopen("/tmp/spvcomp_frag.frag", "w");
@@ -376,15 +486,20 @@ int main(int argc, char **argv)
    VkDescriptorSetLayoutBinding lb[64];
    for (int i = 0; i < nbinds; i++)
       lb[i] = (VkDescriptorSetLayoutBinding){binds[i].binding, binds[i].type, 1,
-                                             VK_SHADER_STAGE_ALL_GRAPHICS};
+                                             is_cs ? VK_SHADER_STAGE_COMPUTE_BIT
+                                                   : VK_SHADER_STAGE_ALL_GRAPHICS};
    VkDescriptorSetLayoutCreateInfo dli = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                           .bindingCount = nbinds, .pBindings = lb};
    VkDescriptorSetLayout dsl; CK(vkCreateDescriptorSetLayout(dev, &dli, NULL, &dsl));
-   VkPushConstantRange pcr = {VK_SHADER_STAGE_ALL_GRAPHICS, 0, 128};
+   VkPushConstantRange pcr = {is_cs ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS,
+                              0, 128};
    VkPipelineLayoutCreateInfo pli = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                      .setLayoutCount = 1, .pSetLayouts = &dsl,
                                      .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
    VkPipelineLayout pl; CK(vkCreatePipelineLayout(dev, &pli, NULL, &pl));
+   if (is_cs)
+      return run_compute(pd, gipa(inst, "vkGetPhysicalDeviceMemoryProperties"), gdpa, pl, dsl,
+                         binds, nbinds, w, nw);
 
    VkShaderModuleCreateInfo vmi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
                                    .codeSize = nw * 4, .pCode = w};

@@ -189,3 +189,34 @@ Graphics Test's D3D12 cube panel was blank on some launches while its D3D11 inte
 presenting into the same window; the cube shows on others. FL 11_0 only (11_1 needs 64
 storage images per stage, v7 exposes 32; 12_0 needs sparse resources).
 
+## 9. 1.2.3: Eden
+
+Eden (a yuzu-based Switch emulator) loads the same AdrenoTools zip. Its process can't read
+`/sdcard/Download`, so `panvk_env.txt` is now also looked up in the app's own
+`Android/data/<package>/files/` (package name from `/proc/self/cmdline`).
+
+**Crash in `vkCmdClearAttachments` (0042).** Eden binds textures through push
+descriptors. The command buffer kept room for 32 push descriptors as hardware
+descriptors, one each, but a combined image sampler can take up to five; the meta
+clear's descriptor write ran past the array. Storage is now `MAX_PUSH_DESCS * 5`, with an assert on layout creation.
+
+**NieR:Automata crash (0044).** The failed-job log pointed at a compute dispatch. The
+shader (dumped from Eden's SPIR-V) has 1024 invocations per workgroup and uses subgroup
+operations. The
+large-workgroup pass (0012) bailed on any subgroup intrinsic, so the workgroup was
+launched with 1024 threads on hardware that holds 384. Subgroups don't cross a copy:
+hardware invocation h, copy c is logical invocation `h + c·H`, and H is a multiple of
+the subgroup size, so a subgroup is the same set of threads in every copy. Only
+`gl_SubgroupID` and `gl_NumSubgroups` need rewriting (from the logical index); only
+`load_global_invocation_index` still blocks the split. `lwgtest` reproduces it standalone.
+A 256-invocation shader with a barrier inside control flow is still left unsplit (fits on
+the hardware; the split needs top-level barriers).
+
+**Performance (Zelda: Echoes of Wisdom, 16–20 FPS).** GPU-bound. The profiler's batch
+counters: ~85 render passes per frame, 74 % with a single draw; each pays a tile load and
+store. Consecutive passes on the same image are feedback loops (attachment write, barrier,
+fragment-shader read), so merging them would be wrong. Barriers whose destination is only
+TOP_OF_PIPE, or source only BOTTOM_OF_PIPE, wait for nothing and no longer split the batch
+(0043); that removed the extra splits but not the passes themselves. Clear-only passes are
+~10 % of them; folding them into the next pass's load is the remaining idea (5–10 %).
+

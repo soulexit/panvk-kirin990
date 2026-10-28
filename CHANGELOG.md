@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.2.3 (testing) — 2026-10-28
+
+First release tested in **Eden** (Switch emulator) too. The same zip installs in
+Winlator and Eden; versions no longer carry the `-winlator` suffix.
+
+- **Fixed: Eden crashed in `vkCmdClearAttachments`** (0042). Push-descriptor storage was
+  sized in API descriptors; a combined image sampler takes up to 5 hardware descriptors.
+- **Fixed: NieR:Automata in Eden crashed** (0044) with a GPU fault: its 1024-invocation
+  compute shaders use subgroup operations, which the large-workgroup split refused, so they
+  ran unsplit on the G76 (max 384). They are split now, with `gl_SubgroupID` /
+  `gl_NumSubgroups` rewritten per logical invocation. `tests/tools/lwgtest`: 1.2.2 got
+  1 280 of 5 120 invocations wrong, 1.2.3 none.
+- Barriers with nothing to wait for no longer end the GPU batch (0043).
+- `panvk_env.txt` is also read from `/sdcard/Android/data/<package>/files/` for apps
+  without storage access (Eden).
+- Profiler: batches/s and why they were split, slow shader compiles, and the last 128 GPU
+  jobs when one fails (0043, 0045).
+- Tools: `tests/tools/lwgtest/`, `tests/tools/gsreplay/`, `tests/tools/fmtprobe.c`,
+  compute mode in `spvcomp`.
+- CTS on the release build: no new failures against 1.2.2 (regression sample 18 846 pass
+  plus the two known flaky cases, storage-buffer robustness 5 294 / 0 fail,
+  synchronization2 and large-workgroup/subgroup lists unchanged).
+
 ## 1.2.2-winlator (testing) — 2026-10-27
 
 - **Faster skinned vertex shaders** (NieR:Automata), two compiler changes:

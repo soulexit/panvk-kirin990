@@ -1,0 +1,116 @@
+From e53ed5c178d29ab4349f03d46cee935f14bc7df1 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Wed, 28 Oct 2026 20:44:23 +0300
+Subject: [PATCH 45/45] panvk/jm: GPU profile dumps the last 128 atoms on the
+ first failure
+
+With PANVK_GPU_PROF=1, each submitted atom is recorded (submit and
+completion time, what the batch ran, TLS/WLS sizes); the first failed
+atom prints the history. kbase reports a context fault on whatever was
+running, so the history shows what ran just before. Found the unsplit
+1024-invocation workgroups behind Eden's NieR:Automata crash.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c | 65 +++++++++++++++++++++
+ 1 file changed, 65 insertions(+)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 3a8385b..8757c38 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -163,12 +163,59 @@ panvk_reset_issued_batch(struct panvk_cmd_buffer *cmdbuf,
+  * printed by kbase when that atom fails (kbase_kmod_atom_fail_cb). */
+ static char panvk_diag_atoms[256][128];
+ 
++/* Diagnostics: history of the last 128 submitted atoms (submit and
++ * completion time, what they ran), dumped once on the first failed atom, so
++ * the job that brought the context down shows up even when kbase reports
++ * whatever was running at the time. On with PANVK_GPU_PROF=1. */
++struct panvk_diag_hist {
++   uint64_t submit_ns, done_ns;
++   unsigned atom;
++   char desc[160];
++};
++static struct panvk_diag_hist panvk_diag_hist[128];
++static unsigned panvk_diag_hist_n;
++static bool panvk_diag_hist_dumped;
++static simple_mtx_t panvk_diag_hist_lock = SIMPLE_MTX_INITIALIZER;
++
++static void
++panvk_diag_hist_done(unsigned atom)
++{
++   simple_mtx_lock(&panvk_diag_hist_lock);
++   for (unsigned i = 0; i < 128 && i < panvk_diag_hist_n; i++) {
++      struct panvk_diag_hist *h = &panvk_diag_hist[(panvk_diag_hist_n - 1 - i) & 127];
++      if (h->atom == atom && !h->done_ns) {
++         h->done_ns = os_time_get_nano();
++         break;
++      }
++   }
++   simple_mtx_unlock(&panvk_diag_hist_lock);
++}
++
+ static void
+ panvk_diag_atom_failed(unsigned atom)
+ {
+    mesa_loge("panvk: failed atom %u ran: %s", atom,
+              panvk_diag_atoms[atom & 255][0] ? panvk_diag_atoms[atom & 255]
+                                              : "(unknown)");
++   simple_mtx_lock(&panvk_diag_hist_lock);
++   if (!panvk_diag_hist_dumped && panvk_diag_hist_n) {
++      panvk_diag_hist_dumped = true;
++      const uint64_t now = os_time_get_nano();
++      const unsigned n = MIN2(panvk_diag_hist_n, 128);
++      mesa_loge("panvk: last %u atoms before the failure (ms before now):", n);
++      for (unsigned i = n; i-- > 0;) {
++         const struct panvk_diag_hist *h =
++            &panvk_diag_hist[(panvk_diag_hist_n - 1 - i) & 127];
++         if (h->done_ns)
++            mesa_loge("HIST atom %3u sub -%.1f done -%.1f (%.1f ms) %s", h->atom,
++                      (now - h->submit_ns) / 1e6, (now - h->done_ns) / 1e6,
++                      (h->done_ns - h->submit_ns) / 1e6, h->desc);
++         else
++            mesa_loge("HIST atom %3u sub -%.1f NOT DONE %s", h->atom,
++                      (now - h->submit_ns) / 1e6, h->desc);
++      }
++   }
++   simple_mtx_unlock(&panvk_diag_hist_lock);
+ }
+ 
+ /* PANVK_GPU_PROF=1: GPU time per batch kind.  Atoms of a queue run in
+@@ -299,6 +346,7 @@ panvk_gprof_report_locked(uint64_t now)
+ static void
+ panvk_gprof_done(unsigned atom)
+ {
++   panvk_diag_hist_done(atom);
+    simple_mtx_lock(&panvk_gprof_lock);
+    const uint64_t now = os_time_get_nano();
+    const int k = panvk_gprof_kind_of[atom & 255];
+@@ -379,6 +427,23 @@ panvk_diag_note_atom(uint64_t atom, const char *kind,
+    if (panvk_gprof_on())
+       panvk_gprof_submit(atom, kind, batch);
+    kbase_kmod_atom_fail_cb = panvk_diag_atom_failed;
++   if (panvk_gprof_on()) {
++      simple_mtx_lock(&panvk_diag_hist_lock);
++      struct panvk_diag_hist *h = &panvk_diag_hist[panvk_diag_hist_n++ & 127];
++      h->submit_ns = os_time_get_nano();
++      h->done_ns = 0;
++      h->atom = atom & 255;
++      snprintf(h->desc, sizeof(h->desc),
++               "%s fb=%ux%u draws=%u gs=%u tess=%u disp=%u cs=%08x wg=%ux%ux%u "
++               "l=%ux%u tls=%u wls=%u vtc=%u frag=%u",
++               kind, batch->diag.fb_w, batch->diag.fb_h, batch->diag.draws,
++               batch->diag.gs, batch->diag.tess, batch->diag.dispatches,
++               batch->diag.cs_hash, batch->diag.wg[0], batch->diag.wg[1],
++               batch->diag.wg[2], batch->diag.local[0], batch->diag.local[1],
++               batch->tlsinfo.tls.size, (unsigned)batch->wls_total_size,
++               batch->vtc_jc.job_index, batch->frag_jc.job_index);
++      simple_mtx_unlock(&panvk_diag_hist_lock);
++   }
+    snprintf(panvk_diag_atoms[atom & 255], sizeof(panvk_diag_atoms[0]),
+             "%s fb=%ux%u draws=%u gs=%u tess=%u xfb=%u max_verts=%llu "
+             "vtc_jobs=%u frag_jobs=%u disp=%u cs=%08x wg=%ux%ux%u "
+-- 
+2.43.0
+

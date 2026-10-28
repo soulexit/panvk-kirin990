@@ -1,0 +1,226 @@
+From decd41f77b02b802c4f70a2d5c48f5461ad4d1ae Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Wed, 28 Oct 2026 19:26:34 +0300
+Subject: [PATCH 43/45] panvk/jm: skip no-op barriers; GPU profile in apps
+ without storage access
+
+- A pipeline barrier whose second scope is only TOP_OF_PIPE (or whose
+  first scope is only BOTTOM_OF_PIPE), with no layout or queue change,
+  orders nothing, but closed the current batch. Yuzu-based emulators
+  (Eden) record ~40 such barriers per frame inside render passes.
+  PANVK_SPLIT_NOOP_BARRIERS=1 restores the split.
+- panvk_env.txt is also read from /sdcard/Android/data/<package>/files,
+  which apps without storage permission (Eden) can read.
+- GPU profile: batch boundaries per second (BeginRendering, barrier
+  splits, no-op barriers) and backend compiles over 5 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c | 50 ++++++++++++++++++++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c   |  4 ++
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c  |  7 +++
+ src/panfrost/vulkan/panvk_instance.c         | 21 +++++++-
+ src/panfrost/vulkan/panvk_priv_bo.h          |  4 ++
+ src/panfrost/vulkan/panvk_vX_shader.c        | 17 +++++++
+ 6 files changed, 101 insertions(+), 2 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index bb6914d..8799e2a 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -720,18 +720,68 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
+    return vk_command_buffer_end(&cmdbuf->vk);
+ }
+ 
++/* A barrier half whose second scope is only TOP_OF_PIPE (or nothing), or
++ * whose first scope is only BOTTOM_OF_PIPE (or nothing), orders nothing and
++ * makes nothing visible. */
++static bool
++panvk_barrier_stages_noop(VkPipelineStageFlags2 src, VkPipelineStageFlags2 dst)
++{
++   return !(dst & ~VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT) ||
++          !(src & ~VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
++}
++
++static bool
++panvk_dependency_is_noop(const VkDependencyInfo *d)
++{
++   for (uint32_t i = 0; i < d->memoryBarrierCount; i++) {
++      const VkMemoryBarrier2 *b = &d->pMemoryBarriers[i];
++      if (!panvk_barrier_stages_noop(b->srcStageMask, b->dstStageMask))
++         return false;
++   }
++   for (uint32_t i = 0; i < d->bufferMemoryBarrierCount; i++) {
++      const VkBufferMemoryBarrier2 *b = &d->pBufferMemoryBarriers[i];
++      if (b->srcQueueFamilyIndex != b->dstQueueFamilyIndex ||
++          !panvk_barrier_stages_noop(b->srcStageMask, b->dstStageMask))
++         return false;
++   }
++   for (uint32_t i = 0; i < d->imageMemoryBarrierCount; i++) {
++      const VkImageMemoryBarrier2 *b = &d->pImageMemoryBarriers[i];
++      if (b->oldLayout != b->newLayout ||
++          b->srcQueueFamilyIndex != b->dstQueueFamilyIndex ||
++          !panvk_barrier_stages_noop(b->srcStageMask, b->dstStageMask))
++         return false;
++   }
++   return true;
++}
++
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+                                     const VkDependencyInfo *pDependencyInfo)
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+ 
++   /* Yuzu-based emulators (Eden) record ~40 barriers per frame inside
++    * render passes from every stage to TOP_OF_PIPE with no access: no-ops,
++    * but each split the batch, so the pass's tiles were stored and loaded
++    * again. PANVK_SPLIT_NOOP_BARRIERS=1 restores the split. */
++   static int split_noop = -1;
++   if (split_noop < 0) {
++      const char *e = getenv("PANVK_SPLIT_NOOP_BARRIERS");
++      split_noop = e && e[0] == '1';
++   }
++   if (!split_noop && panvk_dependency_is_noop(pDependencyInfo)) {
++      p_atomic_inc(&panvk_mem_stats.batch_why[4]);
++      return;
++   }
++
+    /* Caches are flushed/invalidated at batch boundaries for now, nothing to do
+     * for memory barriers assuming we implement barriers with the creation of a
+     * new batch.
+     * FIXME: We can probably do better with a CacheFlush job that has the
+     * barrier flag set to true.
+     */
++   p_atomic_inc(&panvk_mem_stats.batch_why[cmdbuf->cur_batch ? 1 : 2]);
++
+    if (cmdbuf->cur_batch) {
+       panvk_per_arch(cmd_close_batch)(cmdbuf);
+       panvk_per_arch(cmd_open_batch)(cmdbuf);
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 9575d2a..2d2cdb4 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -7547,6 +7547,8 @@ panvk_per_arch(CmdBeginRendering)(VkCommandBuffer commandBuffer,
+    struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
+    bool resuming = pRenderingInfo->flags & VK_RENDERING_RESUMING_BIT;
+ 
++   p_atomic_inc(&panvk_mem_stats.batch_why[0]);
++
+    /* When resuming from a suspended pass, the state should be unchanged. */
+    if (resuming && cmdbuf->cur_batch) {
+       state->render.flags = pRenderingInfo->flags;
+@@ -7572,6 +7574,8 @@ panvk_per_arch(CmdEndRendering)(VkCommandBuffer commandBuffer)
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+ 
++   p_atomic_inc(&panvk_mem_stats.batch_why[3]);
++
+    if (!(cmdbuf->state.gfx.render.flags & VK_RENDERING_SUSPENDING_BIT)) {
+       const struct pan_fb_load *fb_load = &cmdbuf->state.gfx.render.fb.load;
+       bool always_load = fb_load->z.always || fb_load->s.always;
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index b17a9ce..3a8385b 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -267,6 +267,13 @@ panvk_gprof_report_locked(uint64_t now)
+                 "indirdep %.0f tessgs %.0f multiview %.0f batched noidvs %.0f",
+                 dp[0] / secs, dp[1] / secs, dp[2] / secs, dp[3] / secs,
+                 dp[4] / secs, dp[5] / secs, dp[6] / secs);
++      uint64_t bw[5];
++      for (unsigned k = 0; k < 5; k++)
++         bw[k] = p_atomic_xchg(&panvk_mem_stats.batch_why[k], 0);
++      mesa_logi("GPROF batches/s: begin rendering %.0f, barrier split %.0f, "
++                "barrier no batch %.0f, end rendering %.0f, no-op barriers %.0f",
++                bw[0] / secs, bw[1] / secs, bw[2] / secs, bw[3] / secs,
++                bw[4] / secs);
+    }
+    for (unsigned r = 0; r < 16; r++) {
+       int best = -1;
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index a743e2c..4da6ca9 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -299,8 +299,25 @@ static void __attribute__((constructor))
+ panvk_load_env_file(void)
+ {
+    FILE *f = fopen("/sdcard/Download/panvk_env.txt", "r");
+-   if (!f)
+-      return;
++   if (!f) {
++      /* Apps without storage permission (Eden) can always read their own
++       * external files directory: /sdcard/Android/data/<package>/files. */
++      char pkg[128] = "", path[256];
++      FILE *c = fopen("/proc/self/cmdline", "r");
++      if (c) {
++         if (!fgets(pkg, sizeof(pkg), c))
++            pkg[0] = 0;
++         fclose(c);
++      }
++      pkg[strcspn(pkg, ":")] = 0;
++      if (!pkg[0])
++         return;
++      snprintf(path, sizeof(path), "/sdcard/Android/data/%s/files/panvk_env.txt",
++               pkg);
++      f = fopen(path, "r");
++      if (!f)
++         return;
++   }
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+       line[strcspn(line, "\r\n")] = 0;
+diff --git a/src/panfrost/vulkan/panvk_priv_bo.h b/src/panfrost/vulkan/panvk_priv_bo.h
+index 4a09635..dbf8a6b 100644
+--- a/src/panfrost/vulkan/panvk_priv_bo.h
++++ b/src/panfrost/vulkan/panvk_priv_bo.h
+@@ -58,6 +58,10 @@ struct panvk_mem_stats {
+     * writes memory, waits on an indirect job, tess/GS, multiview, batched
+     * without IDVS. */
+    uint64_t draw_path[7];
++   /* Batch boundaries (GPU profile report): BeginRendering, a barrier that
++    * split an open batch, a barrier without one, EndRendering, a no-op
++    * barrier skipped. */
++   uint64_t batch_why[5];
+ };
+ 
+ extern struct panvk_mem_stats panvk_mem_stats;
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 57644fa..9cd7bee 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -29,6 +29,7 @@
+ #include "libpoly.h"
+ #else
+ /* Tessellation on v6/v7 (jm-v7 014). */
++#include "util/os_time.h"
+ #include "util/format/u_format.h"
+ #include "poly/geometry.h"
+ #include "poly/tessellator.h"
+@@ -4151,8 +4152,24 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
+    input.fau.promote_immediates = true;
+ 
+    struct util_dynarray binary = UTIL_DYNARRAY_INIT;
++   const int64_t compile_start = os_time_get_nano();
+    pan_shader_compile(nir, &input, &binary, &shader->info);
+ 
++   /* GPU profile: backend compiles over 5 ms, which stall apps that
++    * compile pipelines while drawing (emulators). */
++   {
++      static int gprof_c = -1;
++      if (gprof_c < 0) {
++         const char *e = getenv("PANVK_GPU_PROF");
++         gprof_c = e && e[0] == '1';
++      }
++      const double ms = (os_time_get_nano() - compile_start) / 1e6;
++      if (gprof_c && ms > 5.0)
++         mesa_logi("GPROF compile %s %.1f ms, %u B code",
++                   _mesa_shader_stage_to_abbrev(nir->info.stage), ms,
++                   (unsigned)util_dynarray_num_elements(&binary, uint8_t));
++   }
++
+    /* GPU profile: shaders that need stack memory (spills, local arrays) or
+     * more than 32 registers (half the threads per core on Bifrost). */
+    if (shader->info.tls_size || shader->info.work_reg_count > 32) {
+-- 
+2.43.0
+

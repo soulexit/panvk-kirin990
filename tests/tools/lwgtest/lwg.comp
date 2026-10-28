@@ -1,0 +1,22 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 1024) in;
+layout(std430, binding = 0) buffer Out { uint o[]; };
+shared uint s[1024];
+void main() {
+   uint i = gl_LocalInvocationIndex;
+   uint sg = gl_SubgroupSize;
+   uint base = i - i % sg;
+   uint want_sum = base * sg + sg * (sg - 1u) / 2u;
+   uint ok = 0u;
+   if (gl_SubgroupID == i / sg) ok |= 1u;
+   if (gl_NumSubgroups == 1024u / sg) ok |= 2u;
+   if (subgroupAdd(i) == want_sum) ok |= 4u;
+   if (bitCount(subgroupBallot(true).x) == min(sg, 32u)) ok |= 8u;
+   s[i] = i * 3u + 1u;
+   barrier();
+   if (s[1023u - i] == (1023u - i) * 3u + 1u) ok |= 16u;
+   o[gl_WorkGroupID.x * 1024u + i] = ok;
+}

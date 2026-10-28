@@ -1,0 +1,95 @@
+From 73b305c11418cb35251d3f4e52882e2d7d916b68 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Wed, 28 Oct 2026 18:19:27 +0300
+Subject: [PATCH 42/45] panvk: size push descriptor storage in hardware
+ descriptors
+
+maxPushDescriptors (MAX_PUSH_DESCS = 32) counts API descriptors, but a
+combined image sampler takes one hardware descriptor per texture plane
+and per sampler descriptor. The push set storage and the meta
+save/restore copy were sized MAX_PUSH_DESCS hardware descriptors, so a
+push layout with more than 16 combined image samplers (yuzu/Eden push
+32) overflowed the heap storage and the stack copy: Eden crashed in
+panvk_v7_CmdClearAttachments restoring a corrupted count.
+
+Size both as MAX_PUSH_HW_DESCS = MAX_PUSH_DESCS * 5 (3 planes + 2
+sampler descriptors) and assert push layouts fit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_cmd_desc_state.h           | 2 +-
+ src/panfrost/vulkan/panvk_cmd_meta.h                 | 4 ++--
+ src/panfrost/vulkan/panvk_descriptor_set_layout.h    | 7 +++++++
+ src/panfrost/vulkan/panvk_vX_descriptor_set_layout.c | 3 +++
+ 4 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_cmd_desc_state.h b/src/panfrost/vulkan/panvk_cmd_desc_state.h
+index 1532f3a..7e87343 100644
+--- a/src/panfrost/vulkan/panvk_cmd_desc_state.h
++++ b/src/panfrost/vulkan/panvk_cmd_desc_state.h
+@@ -54,7 +54,7 @@ panvk_shader_res_table_count(struct panvk_shader_desc_state *shader_desc_state)
+ struct panvk_push_set {
+    struct panvk_cmd_pool_obj base;
+    struct panvk_descriptor_set set;
+-   struct panvk_opaque_desc descs[MAX_PUSH_DESCS];
++   struct panvk_opaque_desc descs[MAX_PUSH_HW_DESCS];
+ };
+ 
+ struct panvk_descriptor_state {
+diff --git a/src/panfrost/vulkan/panvk_cmd_meta.h b/src/panfrost/vulkan/panvk_cmd_meta.h
+index e468a38..fed913b 100644
+--- a/src/panfrost/vulkan/panvk_cmd_meta.h
++++ b/src/panfrost/vulkan/panvk_cmd_meta.h
+@@ -24,7 +24,7 @@ struct panvk_cmd_meta_compute_save_ctx {
+    } cs;
+    const struct panvk_descriptor_set *set0;
+    struct {
+-      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESCS];
++      struct panvk_opaque_desc desc_storage[MAX_PUSH_HW_DESCS];
+       uint64_t descs_dev_addr;
+       uint32_t desc_count;
+       bool dirty;
+@@ -38,7 +38,7 @@ struct panvk_cmd_meta_graphics_save_ctx {
+    const struct panvk_graphics_pipeline *pipeline;
+    const struct panvk_descriptor_set *set0;
+    struct {
+-      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESCS];
++      struct panvk_opaque_desc desc_storage[MAX_PUSH_HW_DESCS];
+       uint64_t descs_dev_addr;
+       uint32_t desc_count;
+       bool dirty;
+diff --git a/src/panfrost/vulkan/panvk_descriptor_set_layout.h b/src/panfrost/vulkan/panvk_descriptor_set_layout.h
+index 35b796f..7c867b4 100644
+--- a/src/panfrost/vulkan/panvk_descriptor_set_layout.h
++++ b/src/panfrost/vulkan/panvk_descriptor_set_layout.h
+@@ -23,6 +23,13 @@
+ #define MAX_DYNAMIC_UNIFORM_BUFFERS   16
+ #define MAX_DYNAMIC_STORAGE_BUFFERS   8
+ #define MAX_PUSH_DESCS                32
++/* maxPushDescriptors counts API descriptors, but a combined image sampler
++ * takes one hardware descriptor per texture plane and per sampler
++ * descriptor (up to 3 + 2). Push set storage is sized in hardware
++ * descriptors: sized as MAX_PUSH_DESCS, 32 combined image samplers (as
++ * yuzu/Eden push) overflowed it and the meta save/restore copy on the
++ * stack. */
++#define MAX_PUSH_HW_DESCS             (MAX_PUSH_DESCS * 5)
+ #define MAX_INLINE_UNIFORM_BLOCK_SIZE (1 << 16)
+ #define MAX_DYNAMIC_BUFFERS                                                    \
+    (MAX_DYNAMIC_UNIFORM_BUFFERS + MAX_DYNAMIC_STORAGE_BUFFERS)
+diff --git a/src/panfrost/vulkan/panvk_vX_descriptor_set_layout.c b/src/panfrost/vulkan/panvk_vX_descriptor_set_layout.c
+index ad0c44d..236818a 100644
+--- a/src/panfrost/vulkan/panvk_vX_descriptor_set_layout.c
++++ b/src/panfrost/vulkan/panvk_vX_descriptor_set_layout.c
+@@ -201,6 +201,9 @@ panvk_per_arch(CreateDescriptorSetLayout)(
+    }
+ 
+    layout->desc_count = desc_idx;
++   assert(!(pCreateInfo->flags &
++            VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) ||
++          layout->desc_count <= MAX_PUSH_HW_DESCS);
+    layout->dyn_buf_count = dyn_buf_idx;
+    layout->dyn_ssbos = dyn_ssbos;
+ 
+-- 
+2.43.0
+
