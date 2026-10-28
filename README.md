@@ -11,10 +11,10 @@ is a single zip.
 It is built on [zenithblue-oss/panvk-kbase-android](https://github.com/zenithblue-oss/panvk-kbase-android)
 (Bifrost geometry / tessellation / transform-feedback emulation, robustness2,
 depth bounds, …) plus the Kirin 990 fixes in [`patches/`](patches/). This repository was
-`panvk-kirin990-winlator` until 1.2.3; old links redirect here. Older companion repos:
-[`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kirin990-termux) (Termux build,
-earlier series), [`panvk-kirin990-armsx2`](https://github.com/soulexit/panvk-kirin990-armsx2)
-(ARMSX2 packs).
+`panvk-kirin990-winlator` until 1.2.3; old links redirect here. Archived, read-only
+predecessors: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kirin990-termux)
+(Termux build, earlier series) and [`panvk-kirin990-armsx2`](https://github.com/soulexit/panvk-kirin990-armsx2)
+(ARMSX2 packs); new releases for those apps come from here too.
 
 ## Download
 
