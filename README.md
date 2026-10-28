@@ -1,32 +1,75 @@
-# panvk-kirin990-winlator
+# panvk-kirin990
 
-Mesa **PanVK** Vulkan driver for **Winlator** and **Eden** (Switch emulator) on the Huawei P40 / Kirin 990
-(**Mali-G76 MC16**), running on the phone's stock `mali_kbase` (JM) kernel driver
-— no root, no custom kernel.
+Mesa **PanVK** Vulkan driver for the Huawei P40 / Kirin 990 (**Mali-G76 MC16**), on the
+phone's stock `mali_kbase` (JM) kernel driver: no root, no custom kernel. **One driver
+for every app** that loads AdrenoTools drivers: Winlator, Eden, and others. Each release
+is a single zip.
 
 > **Testing build.** This is an experimental, non-conformant driver for one device
 > family. Keep a working driver installed as a fallback.
 
 It is built on [zenithblue-oss/panvk-kbase-android](https://github.com/zenithblue-oss/panvk-kbase-android)
 (Bifrost geometry / tessellation / transform-feedback emulation, robustness2,
-depth bounds, …) plus the Kirin 990 and Winlator fixes in [`patches/`](patches/).
-Companion repos: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kirin990-termux)
-(Termux build, earlier series) and [`panvk-kirin990-armsx2`](https://github.com/soulexit/panvk-kirin990-armsx2)
+depth bounds, …) plus the Kirin 990 fixes in [`patches/`](patches/). This repository was
+`panvk-kirin990-winlator` until 1.2.3; old links redirect here. Older companion repos:
+[`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kirin990-termux) (Termux build,
+earlier series), [`panvk-kirin990-armsx2`](https://github.com/soulexit/panvk-kirin990-armsx2)
 (ARMSX2 packs).
 
-## At a glance
+## Download
+
+Latest: **1.2.3** (pre-release), `panvk-g76-kirin990-1.2.3.zip` from
+[releases](https://github.com/soulexit/panvk-kirin990/releases).
+
+```text
+sha256:  44cd4bc4785ab788219e73e17fbef3f9b6351d9a90ec2e71264ac56aa830825b
+.so:     8ad6819c0f8b7099e1a0119d86aa4fb21756340026f7aa12fe46ce507a49aefa
+source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0045 (tree e53ed5c178)
+```
+
+Older releases and hashes: [docs/RELEASES.md](docs/RELEASES.md). Changes: [CHANGELOG.md](CHANGELOG.md).
+
+## Install
+
+Install the zip as it is (don't unzip it) in the app's driver manager:
+
+| App | Where | Driver options file | Guide |
+|---|---|---|---|
+| **Winlator** (cmod 4.1) | Contents / driver manager; then Graphics Driver in the container | `/sdcard/Download/panvk_env.txt` | [docs/apps/winlator.md](docs/apps/winlator.md) |
+| **Eden** (Switch) | Settings → GPU driver manager | `/sdcard/Android/data/dev.legacy.eden_emulator.nightly/files/panvk_env.txt` | [docs/apps/eden.md](docs/apps/eden.md) |
+| Other AdrenoTools apps | their driver manager | `/sdcard/Download/` if the app can read it, else `/sdcard/Android/data/<package>/files/` | untested |
+
+## Games and tests
+
+Everything tested so far on the P40 (Mali-G76) unless noted. FPS as seen on screen or from
+the driver's profiler; the newest version each was tested with.
+
+| App | Game / test | API | Version | Result |
+|---|---|---|---|---|
+| Winlator | AIO Graphics Test, D3D11 cube | D3D11 (DXVK) | 1.0.0 → | ~260–270 FPS (Sarek 1.11, 1.10.3, 2.3.1); A51 (G72) 213 FPS |
+| Winlator | AIO Graphics Test, D3D9 cube | D3D9 (DXVK) | 1.0.0 → | ~74 FPS with Box64 Performance (5.5 FPS with Compatibility); A51 60 FPS |
+| Winlator | AIO Graphics Test, D3D12 cube | D3D12 (VKD3D-Proton 2.14.1) | 1.2.2 | cube shows |
+| Winlator | `d3d12diag` (14 draw/readback cases, presenting) | D3D12 | 1.2.2 | all pass |
+| Winlator | NieR:Automata | D3D11 (DXVK-Sarek 1.12) | 1.2.2 | **playable but slow**: ~20 FPS menus, ~10–14 FPS in game (GPU-bound vertex shading); needs `heap_memory_percent=0.42` |
+| Winlator | Need for Speed: Most Wanted (low) | D3D9 | 1.2.0 | runs; ~22 FPS on 1.1.0, per-draw cost cut 2.4× in 1.2.0 |
+| Winlator | Mortal Kombat Komplete Edition | D3D9, 32-bit | 1.2.2 | **crashes** (R6025 / page fault in the game under Wine WoW64; no driver errors); ~13 FPS before that |
+| Winlator | DmC: Devil May Cry | D3D9, 32-bit | 1.2.2 | **crashes** at start (R6025, same WoW64 issue) |
+| Winlator | Renderer Driver = PanVK (compositor) | Vulkan | 1.2.1 | works, 60 Hz |
+| Eden | NieR:Automata – The End of YoRHa Edition | Vulkan | 1.2.3 | **runs, no crashes** (crashed on 1.2.2) |
+| Eden | Zelda: Echoes of Wisdom | Vulkan | 1.2.3 | **playable**: 16–20 FPS with Huawei performance mode (8–12 without), some stutter; 2D menu smooth |
+| – | Vulkan CTS (dEQP-VK 1.4.7.0) | Vulkan 1.3 | 1.1.0, 1.2.3 | 94 k cases pass in a 1/10 sample of the suite (1.1.0); 1.2.3: no new failures vs 1.2.2 on the 18 848-case regression sample. [docs/CTS.md](docs/CTS.md) |
+
+Per-game settings and details: [Winlator](docs/apps/winlator.md#notes-per-game),
+[Eden](docs/apps/eden.md). Tested something else? Open an issue with the app, game,
+driver version and what you saw.
+
+## Driver at a glance
 
 | | Previous Kirin 990 Winlator pack | This driver (1.2.3) |
 |---|---|---|
-| D3D11 (AIO cube) | works | ~260–270 FPS |
-| D3D9 (AIO cube) | ~5 FPS | **~74 FPS** with the Performance emulator preset (see *Settings*) |
 | DXVK 2.x requirements (robustness2, nullDescriptor, …) | missing | all 56 hard requirements present |
 | Geometry shaders / tessellation / transform feedback | advertised but not implemented (GPU hang) | implemented (emulated), tests pass |
 | VKD3D-Proton (D3D12) | no | feature level 11_0, shader model 6.5; draws, readback and presenting checked (1.2.2); AIO D3D12 cube shows |
-| NieR:Automata | GPU hang on the boot screen | title screen and menu ~20 FPS; in game GPU-bound but much faster: indexed draws/s ~1 000 (1.1.0) → ~6 000, heavy batches 188/110 → ~13/8 ms; 1.2.2: skinning vertex shaders another 10–20 % faster |
-| Eden (Switch emulator) | – | **runs** (1.2.3): NieR:Automata (crashed before), Zelda: Echoes of Wisdom 16–20 FPS with Huawei's performance mode |
-| Winlator Renderer Driver = PanVK | black screen | **works** (1.2.1), 60 Hz |
-| Need for Speed: Most Wanted (D3D9, low) | – | 1.2.0: indexed draws/s 11 500 → 27 300, submit→done 88 → 18 ms (was ~22 FPS, GPU-bound on per-draw jobs) |
 | Vulkan CTS (dEQP-VK 1.4.7.0) | – | 94 k cases pass in a 1/10 sample of the whole suite; API/info group 18 failures of 20 k (was 610). See [docs/CTS.md](docs/CTS.md) |
 
 ## Device
@@ -41,81 +84,6 @@ Companion repos: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kir
 
 Also checked on a Galaxy A51 (Exynos 9611, Mali-G72 MP3, AOSP 16, kbase uAPI 11.35):
 same build runs; all tests pass (see *Results*).
-
-## Install
-
-Download `panvk-g76-kirin990-1.2.3.zip` from the
-[releases](https://github.com/soulexit/panvk-kirin990-winlator/releases). The same zip
-works in every app that loads AdrenoTools drivers; do not unzip it.
-
-- **Winlator:** **Contents** (or the driver manager) → install the zip; in the container
-  (or the game shortcut's settings) set the drivers as in *Settings*.
-- **Eden:** Settings → GPU driver manager → install the zip, select it (globally or per
-  game). Optional driver options go in
-  `/sdcard/Android/data/dev.legacy.eden_emulator.nightly/files/panvk_env.txt` (Eden can't
-  read `/sdcard/Download`).
-
-Release `1.2.3` (pre-release; from 1.2.3 on, versions have no `-winlator` suffix):
-
-```text
-zip:     panvk-g76-kirin990-1.2.3.zip
-sha256:  44cd4bc4785ab788219e73e17fbef3f9b6351d9a90ec2e71264ac56aa830825b
-.so:     8ad6819c0f8b7099e1a0119d86aa4fb21756340026f7aa12fe46ce507a49aefa
-source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0045 (tree e53ed5c178)
-```
-
-Previous release `1.2.2-winlator`:
-
-```text
-zip:     panvk-g76-kirin990-1.2.2-winlator.zip
-sha256:  2d3b5fdd41c56d4750556693b611c84177acb4d767628b794df3aff37bc0fa18
-.so:     3fedea60ab928cf5e35c1fb8516b47d2cc778a44080a60dcb1e1454ec78772fa
-source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0041 (tree 40d8c0c9d8)
-```
-
-Previous release `1.2.0-winlator`:
-
-```text
-zip:     panvk-g76-kirin990-1.2.0-winlator.zip
-sha256:  55868e39f97b1f6eed2cb8aca61088e1733bbb74fa1ac98e54a2c97e7f270a57
-.so:     1f5d8e7f039eb4cb461445a4504ee5539f2631f94766812a8144399cdfbf262f
-source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0036 (tree ded07de903)
-```
-
-1.1.0-winlator (CTS fixes, tree 2b001a2bfd) was not published separately; its changes
-are in 1.2.0.
-
-Previous release `1.0.0-winlator`:
-
-```text
-zip:     panvk-g76-kirin990-1.0.0-winlator.zip
-sha256:  2123e49b8958230d89930c03dbc971fa2b2285f1e1ecbcfc76d387be73cdb728
-.so:     50e9d366cb064cd2686c60f95d5dc83cf94becaf6261ad883129c879b9528d49
-source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0018 (tree 60571fd11b)
-```
-
-The zip is a standard AdrenoTools package: one `libvulkan_panfrost.so`
-(static libc++, no other libraries) and `meta.json` (`minApi` 29).
-
-## Settings (Winlator / DXVK)
-
-These are the settings all results below were measured with (Winlator cmod 4.1).
-
-| Setting | Value | Why |
-|---|---|---|
-| **Graphics Driver** | `PanVK G76 Kirin 990 1.2.3` | the game renders with PanVK |
-| **Renderer Driver** | **System** or `PanVK G76 Kirin 990 1.2.3` | Winlator's screen compositor. Up to 1.2.0 PanVK gave a black screen here (fixed in 1.2.1, patch 0039); System still works and keeps the compositor off PanVK. |
-| **Box64 preset** (x86_64 containers) | **Performance** | COMPATIBILITY enables `BOX64_DYNAREC_STRONGMEM=1`: every emulated memory access gets a barrier. The AIO D3D9 test spent 99 % of its CPU time in one emulated byte-swizzle loop (profiled with `simpleperf`, PanVK was 0.17 %). Performance: D3D9 12 → 60 FPS (A51), 5.5 → ~74 FPS (P40). Use COMPATIBILITY only for a game that breaks. |
-| **FEXCore preset** (ARM64EC containers) | the fastest one / TSO off | same effect as STRONGMEM above |
-| **DXVK** | DXVK-Sarek 1.11/1.12/1.14, DXVK 1.10.3, DXVK 2.3.1 all tested | DXVK 2.x needs robustness2 / null descriptors — present now |
-| VKD3D | 2.x / Proton builds | D3D12 FL 11_0 only (no sparse resources → no FL 12_0) |
-| Wrapper BCn emulation | not needed | the G76 decodes BC1–BC7 natively (tested) |
-| Present mode | default (FIFO/mailbox) | no measurable difference on NieR |
-
-Optional driver options can be set without rebuilding through a text file read at
-driver load, `/sdcard/Download/panvk_env.txt`, or for apps without storage access (Eden)
-`/sdcard/Android/data/<package>/files/panvk_env.txt` (see *Diagnostics*). Leave it absent or
-empty for normal use.
 
 ## Results
 
@@ -146,28 +114,6 @@ requests linear buffers itself).
 - **VKD3D-Proton**: device creation OK (0 hard gaps), FL 11_0, SM 6.5, resource
   binding tier 3, no tiled resources / conservative rasterization / ROVs / mesh /
   ray tracing.
-
-### Winlator
-
-| Test (P40) | Result |
-|---|---|
-| AIO Graphics Test, Direct3D 11 cube | ~260–270 FPS (Sarek 1.11, 1.10.3, 2.3.1) |
-| AIO Graphics Test, Direct3D 9 cube | 5.5 FPS (Box64 COMPATIBILITY) → **~74 FPS** (faster preset), DXVK 1.10.3 |
-| NieR:Automata (DXVK-Sarek 1.12, Proton 9 x86_64) | boots, title screen and settings menu, ~20 FPS on the title screen; no GPU faults in 3 + min |
-
-| AIO Graphics Test, Direct3D 12 cube (VKD3D-Proton 2.14.1) | shows (1.2.2) |
-
-### Eden (Switch emulator, 1.2.3)
-
-| Test (P40) | Result |
-|---|---|
-| NieR:Automata – The End of YoRHa Edition | runs without crashing (1.2.2: GPU context fault in a 1024-invocation compute shader, fixed by 0044) |
-| Zelda: Echoes of Wisdom | 8–12 FPS in cutscenes, 16–20 FPS with Huawei's performance mode; 2D menu smooth. GPU-bound on ~85 render passes per frame; some stutter |
-
-| Test (A51, G72) | Result |
-|---|---|
-| AIO Direct3D 11 cube | 213 FPS |
-| AIO Direct3D 9 cube | 12 FPS (COMPATIBILITY) → 60 FPS (PERFORMANCE, display-capped) |
 
 ## What was fixed (patch series)
 
