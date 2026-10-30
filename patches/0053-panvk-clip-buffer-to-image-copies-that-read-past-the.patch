@@ -1,0 +1,201 @@
+From 0c5e706805382705e710fb4e3ffb7116e1f4a8c9 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Thu, 29 Oct 2026 22:56:13 +0300
+Subject: [PATCH 53/54] panvk: clip buffer-to-image copies that read past their
+ source
+
+The meta copy shader reads the source without bounds. DXVK 2.7 uploads
+a 2048x2048 RGBA8 mip of NieR:Automata from a buffer with 13.5 of the
+16 MiB left; desktop drivers read whatever follows the buffer, but on
+kbase that memory is often unmapped, the read faulted and the device
+was lost at the game's intro.
+
+A colour region whose rows run past the end of its source range is now
+clipped to the rows (and slices) that are there. Valid copies are
+unchanged (CTS buffer-to-image cases identical). PANVK_COPY_CLIP=0
+copies as asked.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_vX_cmd_meta.c | 161 ++++++++++++++++++++++++
+ 1 file changed, 161 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_meta.c b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+index abc441d..95f84a6 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_meta.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+@@ -1896,10 +1896,171 @@ panvk_per_arch(CmdCopyMemoryToImageKHR)(
+    copy_memory_to_image_raw(commandBuffer, pCopyMemoryInfo);
+ }
+ 
++/* Bytes a colour region reads from its source range, and the image rows
++ * (in blocks) of its last slice that fit in range_size. */
++static VkDeviceSize
++copy_region_src_rows(const struct panvk_image *img,
++                     const VkDeviceMemoryImageCopyKHR *r, VkDeviceSize range_size,
++                     uint32_t *fit_rows, uint32_t *fit_slices)
++{
++   const VkFormat fmt = img->vk.format;
++   const uint32_t bw = vk_format_get_blockwidth(fmt);
++   const uint32_t bh = vk_format_get_blockheight(fmt);
++   const uint32_t bpb = vk_format_get_blocksize(fmt);
++   const uint32_t row_len = r->addressRowLength ? r->addressRowLength
++                                                : r->imageExtent.width;
++   const uint32_t img_h = r->addressImageHeight ? r->addressImageHeight
++                                                : r->imageExtent.height;
++   const VkDeviceSize row_pitch = (VkDeviceSize)DIV_ROUND_UP(row_len, bw) * bpb;
++   const VkDeviceSize slice_pitch = DIV_ROUND_UP(img_h, bh) * row_pitch;
++   const VkDeviceSize row_bytes =
++      (VkDeviceSize)DIV_ROUND_UP(r->imageExtent.width, bw) * bpb;
++   const uint32_t rows = DIV_ROUND_UP(r->imageExtent.height, bh);
++   const uint32_t slices =
++      MAX2(r->imageExtent.depth,
++           r->imageSubresource.layerCount == VK_REMAINING_ARRAY_LAYERS
++              ? img->vk.array_layers - r->imageSubresource.baseArrayLayer
++              : r->imageSubresource.layerCount);
++
++   *fit_slices = slices;
++   *fit_rows = rows;
++   if (!rows || !slices || !row_bytes)
++      return 0;
++   const VkDeviceSize need =
++      (slices - 1) * slice_pitch + (rows - 1) * row_pitch + row_bytes;
++   if (need <= range_size)
++      return need;
++
++   /* Whole slices that fit, then the rows of the last one. */
++   uint32_t s = slice_pitch ? MIN2(slices, range_size / slice_pitch) : 0;
++   if (s == slices)
++      s--;
++   const VkDeviceSize left = range_size - s * slice_pitch;
++   const uint32_t r_fit =
++      left >= row_bytes ? MIN2(rows, (left - row_bytes) / row_pitch + 1) : 0;
++   if (r_fit) {
++      *fit_slices = s + 1;
++      *fit_rows = r_fit;
++   } else {
++      *fit_slices = s;
++      *fit_rows = rows;
++   }
++   return need;
++}
++
++static void
++copy_memory_to_image_raw_unclipped(
++   VkCommandBuffer commandBuffer,
++   const VkCopyDeviceMemoryImageInfoKHR* pCopyMemoryInfo);
++
++/* A colour region that reads past the end of its source range (DXVK 2.7
++ * uploads a 2048x2048 RGBA8 mip from a buffer with 13.5 of the 16 MiB left,
++ * NieR:Automata) is clipped to the rows that are there: the copy shader
++ * has no source bounds, and on kbase the memory after a buffer is often
++ * unmapped, so the read faulted and the device was lost. Desktop drivers
++ * read whatever follows. PANVK_COPY_CLIP=0 copies as asked.
++ */
+ static void
+ copy_memory_to_image_raw(
+    VkCommandBuffer commandBuffer,
+    const VkCopyDeviceMemoryImageInfoKHR* pCopyMemoryInfo)
++{
++   VK_FROM_HANDLE(panvk_image, img, pCopyMemoryInfo->image);
++   static int clip = -1;
++   if (clip < 0) {
++      const char *e = getenv("PANVK_COPY_CLIP");
++      clip = !(e && e[0] == '0');
++   }
++
++   bool clipped = false;
++   if (clip && !vk_format_is_depth_or_stencil(img->vk.format)) {
++      for (uint32_t i = 0; i < pCopyMemoryInfo->regionCount && !clipped; i++) {
++         const VkDeviceMemoryImageCopyKHR *r = &pCopyMemoryInfo->pRegions[i];
++         uint32_t fr, fs;
++         if (r->addressRange.size && r->addressRange.size != VK_WHOLE_SIZE &&
++             copy_region_src_rows(img, r, r->addressRange.size, &fr, &fs) >
++                r->addressRange.size)
++            clipped = true;
++      }
++   }
++   if (!clipped) {
++      copy_memory_to_image_raw_unclipped(commandBuffer, pCopyMemoryInfo);
++      return;
++   }
++
++   /* A region can become two (its full slices and the partial last one). */
++   STACK_ARRAY(VkDeviceMemoryImageCopyKHR, regions,
++               2 * pCopyMemoryInfo->regionCount);
++   uint32_t n = 0;
++   for (uint32_t i = 0; i < pCopyMemoryInfo->regionCount; i++) {
++      VkDeviceMemoryImageCopyKHR r = pCopyMemoryInfo->pRegions[i];
++      uint32_t fr, fs;
++      const VkDeviceSize sz = r.addressRange.size;
++      if (sz && sz != VK_WHOLE_SIZE &&
++          copy_region_src_rows(img, &r, sz, &fr, &fs) > sz) {
++         static bool warned;
++         if (!warned) {
++            warned = true;
++            mesa_logw("panvk: a buffer-to-image copy reads past the end of its "
++                      "source (%ux%u, %" PRIu64 " bytes left): copying the "
++                      "rows that are there", r.imageExtent.width,
++                      r.imageExtent.height, (uint64_t)sz);
++         }
++         if (!fs)
++            continue;
++         const uint32_t bh = vk_format_get_blockheight(img->vk.format);
++         /* Full slices first, then the partial last one. */
++         const uint32_t rows = DIV_ROUND_UP(r.imageExtent.height, bh);
++         if (fs > 1 && fr < rows) {
++            VkDeviceMemoryImageCopyKHR full = r;
++            if (r.imageExtent.depth > 1)
++               full.imageExtent.depth = fs - 1;
++            else
++               full.imageSubresource.layerCount = fs - 1;
++            regions[n++] = full;
++            /* The partial slice starts fs - 1 slices in. */
++            const uint32_t bw = vk_format_get_blockwidth(img->vk.format);
++            const uint32_t row_len = r.addressRowLength ? r.addressRowLength
++                                                        : r.imageExtent.width;
++            const uint32_t img_h = r.addressImageHeight ? r.addressImageHeight
++                                                        : r.imageExtent.height;
++            const VkDeviceSize slice_pitch =
++               (VkDeviceSize)DIV_ROUND_UP(img_h, bh) *
++               DIV_ROUND_UP(row_len, bw) * vk_format_get_blocksize(img->vk.format);
++            r.addressRange.address += (fs - 1) * slice_pitch;
++            r.addressRange.size -= (fs - 1) * slice_pitch;
++            if (r.imageExtent.depth > 1) {
++               r.imageOffset.z += fs - 1;
++               r.imageExtent.depth = 1;
++            } else {
++               r.imageSubresource.baseArrayLayer += fs - 1;
++               r.imageSubresource.layerCount = 1;
++            }
++            r.imageExtent.height = MIN2(r.imageExtent.height, fr * bh);
++         } else if (fr < rows) {
++            r.imageExtent.height = MIN2(r.imageExtent.height, fr * bh);
++         } else if (r.imageExtent.depth > 1) {
++            r.imageExtent.depth = fs;
++         } else {
++            r.imageSubresource.layerCount = fs;
++         }
++      }
++      regions[n++] = r;
++   }
++
++   if (n) {
++      VkCopyDeviceMemoryImageInfoKHR info = *pCopyMemoryInfo;
++      info.regionCount = n;
++      info.pRegions = regions;
++      copy_memory_to_image_raw_unclipped(commandBuffer, &info);
++   }
++   STACK_ARRAY_FINISH(regions);
++}
++
++static void
++copy_memory_to_image_raw_unclipped(
++   VkCommandBuffer commandBuffer,
++   const VkCopyDeviceMemoryImageInfoKHR* pCopyMemoryInfo)
+ {
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+-- 
+2.43.0
+

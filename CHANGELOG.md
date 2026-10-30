@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.2.4 (testing) — 2026-10-30
+
+**DXVK 2.4 and later run** (tested: DXVK 2.7.1 gplasync, ARM64EC container).
+
+- **Fixed: black window and lost device with DXVK 2.4+** (0047). DXVK 2.x vertex shaders
+  read vertices from a texel buffer; an indexed draw with no vertex buffers lost its vertex
+  shader's image table, so the GPU read address 0.
+- **DXVK 2.7 draws much cheaper** (0049, 0050, 0052). It records D3D11 draws as indirect
+  draws: their helper work is now one job per batch instead of up to three jobs per draw, and
+  vertex-pulling shaders reuse their image tables instead of a copy job per draw. AIO
+  D3D11 test: 104 → 180–230 FPS. DXVK 1.10.3 / Sarek are still about twice as fast here.
+- **Fixed: lost device on texture uploads that read past their source** (0053). Hit by
+  NieR:Automata with Winlator's BCn emulation on; the copy is clipped. Set **BCn emulation to
+  None** for PanVK: the G76 decodes BC natively.
+- Fixed: bindless textures and samplers in Wine/FEX processes, whose descriptor pools can lie
+  more than 64 GiB from the driver's own memory (0046).
+- Profiler: every draw counted, render pass setup per batch kind (0051). Job decoder:
+  bindless tables skipped, bad addresses flagged, push uniforms printed (0048, 0054).
+- Known issue: NieR:Automata with DXVK 2.7.1, one save goes black (GPU fault, open). Use
+  Sarek 1.12 or 1.10.3 for NieR.
+- Tools: `tests/stress/vpull.c` (DXVK 2.x-style draws); `idraw` and `vpull` built by
+  `scripts/build-tests.sh`.
+- CTS on the release build: no new failures (regression sample 18 846 pass plus the two
+  known flaky cases, storage-buffer robustness, sync2, subgroups, buffer-to-image copies,
+  6 890 indirect-draw and 3 983 vertex-shader image cases).
+
 ## 1.2.3 (testing) — 2026-10-28
 
 First release tested in **Eden** (Switch emulator) too. The same zip installs in

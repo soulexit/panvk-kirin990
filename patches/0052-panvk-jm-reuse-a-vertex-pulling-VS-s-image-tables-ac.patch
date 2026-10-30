@@ -1,0 +1,181 @@
+From 8a6797d6fde97540f620349db6fde0cc8e3a7d04 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Thu, 29 Oct 2026 21:20:43 +0300
+Subject: [PATCH 52/54] panvk/jm: reuse a vertex-pulling VS's image tables
+ across draws
+
+A VS with storage images or texel buffers got a new attribute table and
+a descriptor copy job for every draw (jm-v7 090). With no vertex input
+(vertex pulling, as DXVK 2.x does) nothing in those tables depends on
+the draw, and the index/indirect helpers patch none of their entries,
+so they carry over while the VS and its descriptors are unchanged.
+
+A draw without a copy job of its own now waits for the batch's last VS
+copy job, whose tables it reads. vpull benchmark, 200 pulled draws:
+0.043 -> 0.026-0.031 ms per draw (vertex-buffer draws 0.028).
+PANVK_V7_IMG_REUSE=0 = per-draw tables.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_cmd_buffer.h  |  3 ++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c | 56 +++++++++++++++++++---
+ src/panfrost/vulkan/panvk_cmd_draw.h       |  5 ++
+ 3 files changed, 57 insertions(+), 7 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+index 5b80c1d..ed25a97 100644
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -101,6 +101,9 @@ struct panvk_batch {
+     * is issued again.
+     */
+    struct util_dynarray vary_infos;
++   /* Job index of the last VS descriptor copy job of this batch: a draw
++    * that reuses the tables it filled waits for it. */
++   unsigned last_vs_copy_job;
+    /* Diagnostics: what this batch drew, logged if its atoms fail. */
+    struct {
+       uint32_t draws, gs, tess, xfb, fb_w, fb_h;
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 10b0356..4c986eb 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -1086,7 +1086,8 @@ panvk_draw_emit_attrib(const struct panvk_draw_data *draw,
+  */
+ static VkResult
+ panvk_draw_prepare_vs_attribs(struct panvk_cmd_buffer *cmdbuf,
+-                              struct panvk_draw_data *draw)
++                              struct panvk_draw_data *draw, bool vs_desc_dirty,
++                              bool *img_reused)
+ {
+    const struct panvk_shader *vs = cmdbuf->state.gfx.vs.shader;
+    const struct panvk_shader_variant *vs_variant =
+@@ -1102,6 +1103,31 @@ panvk_draw_prepare_vs_attribs(struct panvk_cmd_buffer *cmdbuf,
+                       vs_variant->info.attribute_count);
+    unsigned attrib_count = num_vs_attribs + num_imgs;
+ 
++   /* A VS with storage images or texel buffers and no vertex input (vertex
++    * pulling, as DXVK 2.x does): the attribute entries are constants and
++    * the image entries depend only on the descriptors, so the tables and
++    * the copy job that filled them carry over while neither the VS nor its
++    * descriptors change. The helper patches nothing in them (no valid
++    * bindings or attributes). PANVK_V7_IMG_REUSE=0 = per-draw tables.
++    */
++   static int img_reuse_knob = -1;
++   if (img_reuse_knob < 0) {
++      const char *e = getenv("PANVK_V7_IMG_REUSE");
++      img_reuse_knob = !(e && e[0] == '0');
++   }
++   const bool img_reusable = img_reuse_knob && num_imgs &&
++                             !vi->bindings_valid && !vi->attributes_valid;
++   *img_reused = false;
++   if (img_reusable && !vs_desc_dirty && cmdbuf->state.gfx.vs.img_tables_valid &&
++       cmdbuf->state.gfx.vs.attribs && cmdbuf->state.gfx.vs.attrib_bufs &&
++       !gfx_state_dirty(cmdbuf, VS) && !dyn_gfx_state_dirty(cmdbuf, VI) &&
++       !dyn_gfx_state_dirty(cmdbuf, VI_BINDINGS_VALID) &&
++       cmdbuf->state.gfx.vs.attr_key.attrib_count == attrib_count) {
++      *img_reused = true;
++      return VK_SUCCESS;
++   }
++   cmdbuf->state.gfx.vs.img_tables_valid = false;
++
+    /* jm-v7 097: a direct draw's tables depend only on the vertex input
+     * state, the vertex buffers, the VS and the draw's padded vertex count,
+     * instancing and raw vertex offset: reuse the previous ones while all of
+@@ -1215,15 +1241,21 @@ panvk_draw_prepare_vs_attribs(struct panvk_cmd_buffer *cmdbuf,
+       cmdbuf->state.gfx.vs.desc.tables[PANVK_BIFROST_DESC_TABLE_IMG] =
+          bufs.gpu + (num_vbs * pan_size(ATTRIBUTE_BUFFER) * 2);
+    }
++   if (img_reusable) {
++      cmdbuf->state.gfx.vs.attr_key.attrib_count = attrib_count;
++      cmdbuf->state.gfx.vs.img_tables_valid = true;
++   }
+ 
+    return VK_SUCCESS;
+ }
+ 
+ static VkResult
+ panvk_draw_prepare_attributes(struct panvk_cmd_buffer *cmdbuf,
+-                              struct panvk_draw_data *draw)
++                              struct panvk_draw_data *draw, bool vs_desc_dirty,
++                              bool *img_reused)
+ {
+-   VkResult result = panvk_draw_prepare_vs_attribs(cmdbuf, draw);
++   VkResult result =
++      panvk_draw_prepare_vs_attribs(cmdbuf, draw, vs_desc_dirty, img_reused);
+    if (result != VK_SUCCESS)
+       return result;
+    draw->vs.attributes = cmdbuf->state.gfx.vs.attribs;
+@@ -2215,7 +2247,9 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
+    /* This allocates and initializes the image table, which we need before we
+     * can copy descriptors.
+     */
+-   result = panvk_draw_prepare_attributes(cmdbuf, draw);
++   bool img_reused = false;
++   result = panvk_draw_prepare_attributes(cmdbuf, draw, vs_desc_dirty,
++                                          &img_reused);
+    if (result != VK_SUCCESS)
+       return result;
+ 
+@@ -2228,7 +2262,7 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
+    const bool vs_has_imgs =
+       vs_desc_info->others.count[PANVK_BIFROST_DESC_TABLE_IMG] != 0;
+ 
+-   if (vs_desc_dirty || vs_has_imgs) {
++   if (vs_desc_dirty || (vs_has_imgs && !img_reused)) {
+       result = panvk_draw_prepare_vs_copy_desc_job(cmdbuf, draw);
+       if (result != VK_SUCCESS)
+          return result;
+@@ -3213,11 +3247,15 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
+ 
+    struct panvk_batch *batch = cmdbuf->cur_batch;
+ 
++   /* Without a copy job of its own the draw reads the tables an earlier
++    * draw's copy job filled: wait for the batch's last one. */
+    unsigned copy_desc_job_id =
+       draw->jobs.vertex_copy_desc.gpu
+          ? pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE, false, false,
+                           0, 0, &draw->jobs.vertex_copy_desc, false)
+-         : 0;
++         : batch->last_vs_copy_job;
++   if (draw->jobs.vertex_copy_desc.gpu)
++      batch->last_vs_copy_job = copy_desc_job_id;
+ 
+    if (draw->jobs.frag_copy_desc.gpu) {
+       /* We don't need to add frag_copy_desc as a dependency because the
+@@ -3325,11 +3363,15 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+    const struct vk_vertex_input_state *vi =
+       cmdbuf->vk.dynamic_graphics_state.vi;
+ 
++   /* Without a copy job of its own the draw reads the tables an earlier
++    * draw's copy job filled: wait for the batch's last one. */
+    unsigned copy_desc_job_id =
+       draw->jobs.vertex_copy_desc.gpu
+          ? pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_COMPUTE, false, false,
+                           0, 0, &draw->jobs.vertex_copy_desc, false)
+-         : 0;
++         : batch->last_vs_copy_job;
++   if (draw->jobs.vertex_copy_desc.gpu)
++      batch->last_vs_copy_job = copy_desc_job_id;
+ 
+    if (draw->jobs.frag_copy_desc.gpu) {
+       /* We don't need to add frag_copy_desc as a dependency because the
+diff --git a/src/panfrost/vulkan/panvk_cmd_draw.h b/src/panfrost/vulkan/panvk_cmd_draw.h
+index 527a43c..5a36dc2 100644
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -262,6 +262,11 @@ struct panvk_cmd_graphics_state {
+          uint32_t attrib_count;
+          bool valid;
+       } attr_key;
++      /* The tables were built for a VS with storage images or texel buffers
++       * and no vertex input: nothing in them depends on the draw, so later
++       * draws reuse them while the VS and its descriptors are unchanged
++       * (no copy job). */
++      bool img_tables_valid;
+ #else
+       /* The number of times desc is repeated.  Zero means that it is not
+        * repeated but also that it's re-usable across draws and we're not
+-- 
+2.43.0
+

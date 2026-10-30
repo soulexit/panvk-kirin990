@@ -30,8 +30,11 @@ spv() { glslangValidator -V "$1" -o "$OUT/gen/$2.spv" >/dev/null; (cd "$OUT/gen"
 spv "$ROOT/tests/stress/s.vert" s.vert; spv "$ROOT/tests/stress/s.frag" s.frag
 cat "$OUT/gen/s.vert_spv.h" "$OUT/gen/s.frag_spv.h" > "$OUT/gen/spv.h"
 spv "$ROOT/tests/lwg/r.comp" r; spv "$ROOT/tests/compositor/c.comp" c
+spv "$ROOT/tests/stress/vpull.vert" vpull.vert
 
 "$CC" -O2 -w $INC -I"$OUT/gen" -I"$ROOT/tests/stress" "$ROOT/tests/stress/stress.c" -o "$OUT/tests/stress" -ldl -lm
+"$CC" -O2 -w $INC -I"$OUT/gen" -I"$ROOT/tests/stress" "$ROOT/tests/stress/idraw.c" -o "$OUT/tests/idraw" -ldl -lm
+"$CC" -O2 -w $INC -I"$OUT/gen" -I"$ROOT/tests/stress" "$ROOT/tests/stress/vpull.c" -o "$OUT/tests/vpull" -ldl -lm
 "$CC" -O1 -w $INC -I"$OUT/gen" "$ROOT/tests/lwg/lwg.c" -o "$OUT/tests/lwg" -ldl
 "$CC" -O1 -w $INC -I"$OUT/gen" -DUSAGE_DST=0x333 "$ROOT/tests/compositor/comp.c" -o "$OUT/tests/compositor" -ldl -landroid -lnativewindow
 A="$ZB/tests/ahb"

@@ -1,0 +1,161 @@
+From 85b8975ec200aff4572453a70e4091ee2baa043e Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Thu, 29 Oct 2026 20:09:19 +0300
+Subject: [PATCH 50/54] panvk/jm: batch the helpers of application non-indexed
+ indirect draws
+
+Every vkCmdDrawIndirect got its own helper job (~35 us of job manager
+time each on the G76). DXVK 2.7 records its D3D11 non-indexed draws as
+one-command indirect draws: the AIO test's swapchain pass had 20 per
+frame, 2.4 ms of vertex/tiler time.
+
+They now join the batch's index-range helper job (index_size 0, lane 0
+patches the draw, the rest of the workgroup returns before the
+reduction), under the conditions of a hoisted indexed draw. vpull
+benchmark, 20 indirect draws: 0.22-0.27 -> 0.048 ms per draw. CTS: 6890
+indirect-draw cases unchanged. PANVK_V7_INDIRECT_FOLD=0 turns it off
+with the indexed fold.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/libpan/draw_helper.cl         | 52 +++++++++++++++++++++-
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c | 39 +++++++++++++++-
+ 2 files changed, 87 insertions(+), 4 deletions(-)
+
+diff --git a/src/panfrost/libpan/draw_helper.cl b/src/panfrost/libpan/draw_helper.cl
+index a0e9323..bf9e332 100644
+--- a/src/panfrost/libpan/draw_helper.cl
++++ b/src/panfrost/libpan/draw_helper.cl
+@@ -1389,8 +1389,8 @@ padded_vertex_count(uint32_t vertex_count, uint32_t instance_count, bool idvs)
+ 
+ /* Argument ordering choosen to avoid any padding */
+ 
+-KERNEL(1)
+-panlib_draw_indirect_helper(
++static void
++draw_indirect_body(
+    global VkDrawIndirectCommand *cmd,
+    global struct mali_attribute_buffer_packed *varying_bufs_descs,
+    global struct libpan_draw_helper_varying_buf_info *varying_bufs_info,
+@@ -1444,6 +1444,29 @@ panlib_draw_indirect_helper(
+    *raw_vertex_offset_sysval = draw.vertex.raw_offset;
+ }
+ 
++KERNEL(1)
++panlib_draw_indirect_helper(
++   global VkDrawIndirectCommand *cmd,
++   global struct mali_attribute_buffer_packed *varying_bufs_descs,
++   global struct libpan_draw_helper_varying_buf_info *varying_bufs_info,
++   global struct mali_attribute_buffer_packed *attrib_bufs_descs,
++   global struct libpan_draw_helper_attrib_buf_info *attrib_bufs_infos,
++   uint32_t attrib_bufs_valid, uint32_t attribs_valid,
++   global struct mali_attribute_packed *attribs_descs,
++   global struct libpan_draw_helper_attrib_info *attribs_infos,
++   global uint32_t *first_vertex_sysval, global uint32_t *first_instance_sysval,
++   global uint32_t *raw_vertex_offset_sysval, global uint8_t *idvs_job,
++   global uint8_t *vertex_job, global uint8_t *tiler_job,
++   uint32_t primitive_vertex_count)
++{
++   draw_indirect_body(cmd, varying_bufs_descs, varying_bufs_info,
++                      attrib_bufs_descs, attrib_bufs_infos, attrib_bufs_valid,
++                      attribs_valid, attribs_descs, attribs_infos,
++                      first_vertex_sysval, first_instance_sysval,
++                      raw_vertex_offset_sysval, idvs_job, vertex_job, tiler_job,
++                      primitive_vertex_count);
++}
++
+ static void
+ draw_indexed_indirect_body(
+    global VkDrawIndexedIndirectCommand *cmd, global uint8_t *index_buffer_ptr,
+@@ -1690,6 +1713,31 @@ panlib_draw_indexed_indirect_minmax_helper_batch(
+    local uint32_t tmax[MINMAX_WG];
+    uint32_t lmin, lmax;
+    constant struct libpan_minmax_draw *d = &draws[cl_group_id.x];
++
++   /* index_size 0: a non-indexed indirect draw, patched by lane 0. The
++    * branch is uniform in the workgroup (one draw per workgroup), so it
++    * returns before the reduction's barriers. */
++   if (d->index_size == 0) {
++      if (cl_local_id.x == 0)
++         draw_indirect_body(
++            (global VkDrawIndirectCommand *)d->cmd,
++            (global struct mali_attribute_buffer_packed *)d->varying_bufs_descs,
++            (global struct libpan_draw_helper_varying_buf_info *)
++               d->varying_bufs_info,
++            (global struct mali_attribute_buffer_packed *)d->attrib_bufs_descs,
++            (global struct libpan_draw_helper_attrib_buf_info *)
++               d->attrib_bufs_infos,
++            d->attrib_bufs_valid, d->attribs_valid,
++            (global struct mali_attribute_packed *)d->attribs_descs,
++            (global struct libpan_draw_helper_attrib_info *)d->attribs_infos,
++            (global uint32_t *)d->first_vertex_sysval,
++            (global uint32_t *)d->first_instance_sysval,
++            (global uint32_t *)d->raw_vertex_offset_sysval,
++            (global uint8_t *)d->idvs_job, (global uint8_t *)d->vertex_job,
++            (global uint8_t *)d->tiler_job, d->primitive_vertex_count);
++      return;
++   }
++
+    global VkDrawIndexedIndirectCommand *cmd =
+       (global VkDrawIndexedIndirectCommand *)d->cmd;
+    global uint8_t *index_buffer_ptr = (global uint8_t *)d->index_buffer_ptr;
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index be36e86..1c914af 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -3690,6 +3690,17 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+                                                     indirect_barrier, args);
+          batch->hoisting = false;
+       } else if (draw->info.indirect.buffer_dev_addr != 0) {
++         /* An application's non-indexed indirect draw joins the batch's
++          * helper job too (index_size 0), under the same conditions as a
++          * hoisted indexed draw: no in-batch producer, VS without memory
++          * writes, no emulation, one layer. DXVK 2.7 draws its D3D11 non-
++          * indexed draws this way (AIO test: 20 per frame, one helper job
++          * each).
++          */
++         const bool batch_noindex =
++            indirect_fold_knob && hoist_knob && batch_minmax && app_indirect &&
++            !vs->info.writes_global && !draw->tess_phase &&
++            !draw->gs_varying_bufs && enabled_layer_count == 1;
+          const struct panlib_draw_indirect_helper_args args = {
+             .cmd = draw->info.indirect.buffer_dev_addr,
+             .primitive_vertex_count =
+@@ -3709,8 +3720,32 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+             .vertex_job = draw->jobs.vertex.gpu,
+             .tiler_job = draw->gs_varying_bufs ? 0 : draw->jobs.tiler.gpu,
+          };
+-         panlib_draw_indirect_helper_struct(&precomp_ctx, indirect_grid,
+-                                            indirect_barrier, args);
++         if (batch_noindex) {
++            const struct libpan_minmax_draw d = {
++               .cmd = args.cmd,
++               .varying_bufs_descs = args.varying_bufs_descs,
++               .varying_bufs_info = args.varying_bufs_info,
++               .attrib_bufs_descs = args.attrib_bufs_descs,
++               .attrib_bufs_infos = args.attrib_bufs_infos,
++               .attribs_descs = args.attribs_descs,
++               .attribs_infos = args.attribs_infos,
++               .first_vertex_sysval = args.first_vertex_sysval,
++               .first_instance_sysval = args.first_instance_sysval,
++               .raw_vertex_offset_sysval = args.raw_vertex_offset_sysval,
++               .idvs_job = args.idvs_job,
++               .vertex_job = args.vertex_job,
++               .tiler_job = args.tiler_job,
++               .index_size = 0,
++               .primitive_vertex_count = args.primitive_vertex_count,
++               .attrib_bufs_valid = args.attrib_bufs_valid,
++               .attribs_valid = args.attribs_valid,
++            };
++            util_dynarray_append(&batch->minmax_draws, d);
++            batched_helper = true;
++         } else {
++            panlib_draw_indirect_helper_struct(&precomp_ctx, indirect_grid,
++                                               indirect_barrier, args);
++         }
+       } else {
+          assert(false && "Invalid indirect draw");
+       }
+-- 
+2.43.0
+

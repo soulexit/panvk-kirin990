@@ -220,3 +220,33 @@ TOP_OF_PIPE, or source only BOTTOM_OF_PIPE, wait for nothing and no longer split
 (0043); that removed the extra splits but not the passes themselves. Clear-only passes are
 ~10 % of them; folding them into the next pass's load is the remaining idea (5–10 %).
 
+## 10. 1.2.4: DXVK 2.7
+
+**Black window.** DXVK 2.7.1 gplasync created the device and then lost it on its first frame.
+A job dump (`PANVK_DEBUG=trace,sync`, `PANDECODE_DUMP_FILE` in `panvk_env.txt`) showed the
+vertex job's attribute table pointer was 0 while its shader declared 16 attributes plus one
+storage image. DXVK 2.x pulls vertices from a texel buffer, so draws have no vertex buffers;
+every indexed draw takes the GPU-patched path, whose helper storage is sized by the number
+of vertex buffers, a zero-sized allocation returns NULL, and that read as out of memory: the
+table was never built and the error was ignored (0047). A bindless fault found on the way,
+reproduced in CTS with descriptor pools placed far from the device's own memory, is 0046.
+
+**Half the speed.** The profiler put 4.6 ms per frame into the vertex/tiler side of one pass
+with ~20 draws: DXVK 2.7 records D3D11 draws as one-command indirect draws, each of which
+got a WRITE_VALUE, an index-range search launched for the whole shared index buffer and a
+helper job, plus a descriptor copy job for its texel buffer. A benchmark of that pattern
+(`tests/stress/vpull.c`) showed the cost grow with the index buffer size. Indirect draws
+now share the batch's one helper job (0049, 0050) and vertex-pulling shaders keep their
+tables (0052): 104 → 180–230 FPS. The rest of the gap to DXVK 1.10.3 (380–550 FPS in the
+same container): 2.7 does about twice the GPU work per frame (passes, queries, indirect
+draws), and the governor runs it at ~260 MHz where 1.10.3 gets ~580 MHz
+(`/sys/class/devfreq/gpufreq/cur_freq` is readable without root). The CPU waits are DXVK's
+own timeline waits; the driver never blocks on the CPU when submitting.
+
+**NieR:Automata.** A compute job faulted at the intro: a buffer-to-image copy reading 16 MiB
+for a 2048x2048 RGBA8 mip from a buffer with 13.5 MiB left. The images were RGBA8 because
+Winlator's wrapper emulated BC textures (`WRAPPER_EMULATE_BCN=3`); with emulation off the
+uploads are BC and correct. Such copies are now clipped (0053). One save still goes black:
+the GPU faults in its first heavy pass (~850 draws, a fragment job reports invalid data);
+not 0049-0052, not the 128 MiB tiler heap (512 MiB changed nothing). Open.
+

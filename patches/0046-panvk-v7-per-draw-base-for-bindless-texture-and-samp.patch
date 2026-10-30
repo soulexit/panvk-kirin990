@@ -1,0 +1,278 @@
+From ea0ecf2d8280749b50ff35d5be95daa3f8a45743 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Wed, 28 Oct 2026 23:49:27 +0300
+Subject: [PATCH 46/54] panvk/v7: per-draw base for bindless texture and
+ sampler tables
+
+The direct (bindless) tables pointed at a device-constant base 64 GiB
+below the null BO, and shaders index set memory from it with a 32-bit
+index. kbase maps GPU memory at its CPU address (SAME_VA), and in
+Wine/FEX processes descriptor pools land more than 64 GiB away; sets
+below the base got index 0 and the GPU faulted (DXVK 2.7, which keeps
+its samplers in an update-after-bind heap: black window, device lost).
+
+The base is now the lowest of the null BO's dummy sampler and the bound
+sets, computed per draw/dispatch from what is bound, so the shared
+sysvals and each stage's tables agree; tables built with another base
+are rebuilt. PANVK_VA_HOLE_GB=n reserves address space after device
+creation to reproduce the placement in tests. PANDECODE_* keys are
+accepted in panvk_env.txt.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../vulkan/jm/panvk_vX_cmd_dispatch.c         |  4 ++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c    | 24 +++++++--
+ src/panfrost/vulkan/panvk_cmd_desc_state.h    | 49 ++++++++++++++++---
+ src/panfrost/vulkan/panvk_device.h            | 12 -----
+ src/panfrost/vulkan/panvk_instance.c          |  1 +
+ src/panfrost/vulkan/panvk_vX_cmd_desc_state.c |  3 +-
+ src/panfrost/vulkan/panvk_vX_cmd_dispatch.c   |  3 +-
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c       |  3 +-
+ src/panfrost/vulkan/panvk_vX_device.c         | 12 +++++
+ 9 files changed, 84 insertions(+), 27 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c
+index dd5dd87..3f19707 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_dispatch.c
+@@ -227,6 +227,10 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
+ #else
+    if (compute_state_dirty(cmdbuf, CS) ||
+        compute_state_dirty(cmdbuf, DESC_STATE)) {
++      /* Moves only with the bound sets, i.e. with DESC_STATE. */
++      cs_desc_state->direct_base = panvk_desc_direct_base(
++         desc_state, to_panvk_device(cmdbuf->vk.base.device)
++                        ->null_descs.dummy_sampler_addr);
+       result = panvk_per_arch(cmd_prepare_shader_desc_tables)(
+          cmdbuf, desc_state, cs_desc_info, true, cs_desc_state);
+       if (result != VK_SUCCESS)
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 2d2cdb4..d9f3a0e 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -2169,11 +2169,23 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
+                                                : ~0u;
+    cmdbuf->state.gfx.v7_dirty_sets = 0;
+    cmdbuf->state.gfx.v7_dirty_sets_valid = false;
++   /* The direct (bindless) base moves with the bound sets; tables built
++    * with another base are rebuilt. */
++   const uint64_t direct_base = panvk_desc_direct_base(
++      desc_state, to_panvk_device(cmdbuf->vk.base.device)
++                     ->null_descs.dummy_sampler_addr);
++   struct panvk_shader_desc_state *vs_ds = &cmdbuf->state.gfx.vs.desc;
++   struct panvk_shader_desc_state *fs_ds = &cmdbuf->state.gfx.fs.desc;
+    const bool vs_desc_dirty = (dirty_sets & vs_desc_info->used_set_mask) ||
+-                              gfx_state_dirty(cmdbuf, VS);
++                              gfx_state_dirty(cmdbuf, VS) ||
++                              (vs_desc_info->direct_mask &&
++                               vs_ds->direct_base != direct_base);
+    const bool fs_desc_dirty =
+       (fs ? (dirty_sets & fs_desc_info->used_set_mask) != 0 : desc_dirty) ||
+-      gfx_state_dirty(cmdbuf, FS);
++      gfx_state_dirty(cmdbuf, FS) ||
++      (fs && fs_desc_info->direct_mask && fs_ds->direct_base != direct_base);
++   vs_ds->direct_base = direct_base;
++   fs_ds->direct_base = direct_base;
+ 
+    if (gfx_state_dirty(cmdbuf, DESC_STATE) || gfx_state_dirty(cmdbuf, VS) ||
+        gfx_state_dirty(cmdbuf, FS)) {
+@@ -2378,7 +2390,11 @@ emu_prepare_descs(struct panvk_cmd_buffer *cmdbuf,
+    struct panvk_descriptor_state *desc_state = &cmdbuf->state.gfx.desc_state;
+    const struct panvk_shader_desc_info *info = &shader->desc_info;
+ 
+-   *ds = (struct panvk_shader_desc_state){0};
++   *ds = (struct panvk_shader_desc_state){
++      .direct_base = panvk_desc_direct_base(
++         desc_state, to_panvk_device(cmdbuf->vk.base.device)
++                        ->null_descs.dummy_sampler_addr),
++   };
+    *copy_job = 0;
+ 
+    if (panvk_per_arch(cmd_prepare_push_descs)(cmdbuf, desc_state,
+@@ -2396,7 +2412,7 @@ emu_prepare_descs(struct panvk_cmd_buffer *cmdbuf,
+    }
+    {
+       const struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+-      uint64_t base = panvk_desc_direct_base(dev);
++      uint64_t base = ds->direct_base;
+ 
+       u_foreach_bit(i, info->used_set_mask & BITFIELD_MASK(MAX_SETS)) {
+          const struct panvk_descriptor_set *set = desc_state->sets[i];
+diff --git a/src/panfrost/vulkan/panvk_cmd_desc_state.h b/src/panfrost/vulkan/panvk_cmd_desc_state.h
+index 7e87343..f88ad3a 100644
+--- a/src/panfrost/vulkan/panvk_cmd_desc_state.h
++++ b/src/panfrost/vulkan/panvk_cmd_desc_state.h
+@@ -32,6 +32,8 @@ struct panvk_shader_desc_state {
+    uint64_t tables[PANVK_BIFROST_DESC_TABLE_COUNT];
+    uint64_t img_attrib_table;
+    uint64_t dyn_ssbos;
++   /* Direct base the texture/sampler tables were built with. */
++   uint64_t direct_base;
+ #else
+    struct {
+       uint64_t dev_addr;
+@@ -81,14 +83,47 @@ VkResult panvk_per_arch(cmd_prepare_shader_desc_tables)(
+    struct panvk_shader_desc_state *shader_desc_state);
+ 
+ /* Bindless textures/samplers (jm-v7 050): the direct texture and sampler
+- * tables point at a device-constant base 64 GiB below the device dummy
+- * sampler, and shaders index set memory as (set - base) / 32 + descriptor
+- * (desc.direct_idx sysvals). kbase maps GPU memory at its CPU address
+- * (SAME_VA), so descriptor pools land within the +-64 GiB a 32-bit index
+- * covers. A constant base keeps the textures pointer and the sysvals in
+- * sync whatever is bound.
++ * tables point at a base, and shaders index set memory as
++ * (set - base) / 32 + descriptor (desc.direct_idx sysvals). kbase maps GPU
++ * memory at its CPU address (SAME_VA), and in Wine/FEX processes descriptor
++ * pools land hundreds of GiB apart, more than a 32-bit index covers from
++ * one device-constant base. So the base is the lowest of the dummy sampler
++ * and the bound sets, per draw or dispatch. It depends only on what is
++ * bound, so the sysvals (shared by the VS and FS) and every stage's tables
++ * agree; a stage's tables are rebuilt when it moves
++ * (panvk_shader_desc_state::direct_base).
+  */
+-#define PANVK_DIRECT_BASE_SPAN (64ull << 30)
++#define PANVK_DIRECT_BASE_SPAN ((uint64_t)PANVK_DESCRIPTOR_SIZE << 32)
++
++static inline uint64_t
++panvk_desc_direct_base(const struct panvk_descriptor_state *desc_state,
++                       uint64_t dummy_sampler_addr)
++{
++   uint64_t lo = dummy_sampler_addr;
++   uint64_t hi = dummy_sampler_addr + PANVK_DESCRIPTOR_SIZE;
++
++   for (uint32_t i = 0; i < MAX_SETS; i++) {
++      const struct panvk_descriptor_set *set = desc_state->sets[i];
++
++      if (!set || !set->descs.dev)
++         continue;
++      lo = MIN2(lo, set->descs.dev);
++      hi = MAX2(hi, set->descs.dev +
++                       (uint64_t)set->desc_count * PANVK_DESCRIPTOR_SIZE);
++   }
++
++   if (hi - lo > PANVK_DIRECT_BASE_SPAN) {
++      static bool warned;
++      if (!warned) {
++         warned = true;
++         mesa_logw("panvk: bound descriptor sets span %" PRIu64
++                   " GiB, more than bindless indices reach",
++                   (hi - lo) >> 30);
++      }
++   }
++
++   return lo;
++}
+ 
+ static inline uint32_t
+ panvk_desc_direct_idx(uint64_t base, uint64_t addr)
+diff --git a/src/panfrost/vulkan/panvk_device.h b/src/panfrost/vulkan/panvk_device.h
+index 2178c67..9e23c87 100644
+--- a/src/panfrost/vulkan/panvk_device.h
++++ b/src/panfrost/vulkan/panvk_device.h
+@@ -248,18 +248,6 @@ to_panvk_device(struct vk_device *dev)
+    return container_of(dev, struct panvk_device, vk);
+ }
+ 
+-/* Base of the v6/v7 direct (bindless) texture and sampler tables, see
+- * PANVK_DIRECT_BASE_SPAN in panvk_cmd_desc_state.h (jm-v7 050). Kept 32-byte
+- * aligned like the descriptors.
+- */
+-static inline uint64_t
+-panvk_desc_direct_base(const struct panvk_device *dev)
+-{
+-   const uint64_t span = 64ull << 30;
+-   uint64_t anchor = dev->null_descs.dummy_sampler_addr;
+-
+-   return anchor > span ? anchor - span : 0;
+-}
+ 
+ /* CSF interface information, sourced from the panthor uAPI or from the
+  * kbase GLB interface depending on which backend the device came from.
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index 4da6ca9..85c1df3 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -333,6 +333,7 @@ panvk_load_env_file(void)
+        * size (256 MiB chunks above ~3.8 GiB of heap). */
+       if (strncmp(key, "PANVK_", 6) && strncmp(key, "PAN_", 4) &&
+           strncmp(key, "MESA_", 5) && strncmp(key, "BIFROST_", 8) &&
++          strncmp(key, "PANDECODE_", 10) &&
+           strcmp(key, "heap_memory_percent"))
+          continue;
+       setenv(key, eq + 1, force);
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c b/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
+index d371343..0b1e81c 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
+@@ -252,8 +252,7 @@ panvk_per_arch(cmd_prepare_shader_desc_tables)(
+       desc_info->others.count[PANVK_BIFROST_DESC_TABLE_SAMPLER];
+ 
+    if (desc_info->direct_mask) {
+-      const struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+-      uint64_t base = panvk_desc_direct_base(dev);
++      uint64_t base = shader_desc_state->direct_base;
+ 
+       if (desc_info->direct_mask & PANVK_DIRECT_TEX) {
+          shader_desc_state->tables[PANVK_BIFROST_DESC_TABLE_TEXTURE] = base;
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_dispatch.c b/src/panfrost/vulkan/panvk_vX_cmd_dispatch.c
+index 59b34d0..30b97ca 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_dispatch.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_dispatch.c
+@@ -68,7 +68,8 @@ panvk_per_arch(cmd_prepare_dispatch_sysvals)(
+    /* Bindless textures/samplers (jm-v7 050). */
+    {
+       const struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+-      uint64_t base = panvk_desc_direct_base(dev);
++      uint64_t base =
++         panvk_desc_direct_base(desc_state, dev->null_descs.dummy_sampler_addr);
+ 
+       u_foreach_bit(i, cs_desc_info->used_set_mask) {
+          const struct panvk_descriptor_set *set = desc_state->sets[i];
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+index 28e3d17..0131ade 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -1077,7 +1077,8 @@ panvk_per_arch(cmd_prepare_draw_sysvals)(struct panvk_cmd_buffer *cmdbuf,
+    /* Bindless textures/samplers (jm-v7 050). */
+    {
+       const struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+-      uint64_t base = panvk_desc_direct_base(dev);
++      uint64_t base =
++         panvk_desc_direct_base(desc_state, dev->null_descs.dummy_sampler_addr);
+ 
+       u_foreach_bit(i, used_set_mask) {
+          const struct panvk_descriptor_set *set = desc_state->sets[i];
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index acd32a7..5b4e050 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -10,6 +10,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <sys/mman.h>
+ #include "drm-uapi/panthor_drm.h"
+ 
+ #include "vk_cmd_enqueue_entrypoints.h"
+@@ -556,6 +557,17 @@ panvk_init_null_descs(struct panvk_device *dev)
+    dev->null_descs.dummy_sampler_addr =
+       dev->null_descs.zero_addr + PANVK_NULL_SAMPLER_OFFSET;
+ 
++   /* PANVK_VA_HOLE_GB=n: reserve n GiB of address space now, so later
++    * (SAME_VA) allocations land that far below the null BO, as they do in
++    * Wine/FEX processes. Testing only; the reservation is never freed. */
++   const char *va_hole = getenv("PANVK_VA_HOLE_GB");
++   if (va_hole && atoi(va_hole) > 0) {
++      void *hole = mmap(NULL, (size_t)atoi(va_hole) << 30, PROT_NONE,
++                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++      mesa_logi("panvk: VA hole of %d GiB at %p, null BO at 0x%" PRIx64,
++                atoi(va_hole), hole, dev->null_descs.zero_addr);
++   }
++
+    const VkImageCreateInfo ici = {
+       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+       .imageType = VK_IMAGE_TYPE_2D,
+-- 
+2.43.0
+

@@ -18,13 +18,13 @@ predecessors: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kirin9
 
 ## Download
 
-Latest: **1.2.3** (pre-release), `panvk-g76-kirin990-1.2.3.zip` from
+Latest: **1.2.4** (pre-release), `panvk-g76-kirin990-1.2.4.zip` from
 [releases](https://github.com/soulexit/panvk-kirin990/releases).
 
 ```text
-sha256:  44cd4bc4785ab788219e73e17fbef3f9b6351d9a90ec2e71264ac56aa830825b
-.so:     8ad6819c0f8b7099e1a0119d86aa4fb21756340026f7aa12fe46ce507a49aefa
-source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0045 (tree e53ed5c178)
+sha256:  9e09250cd1b16301a5f5cf282d6da7dfee35375b1fd2346838adfd2f78c0931a
+.so:     c92dcaf1fd8d91265930211f3ac1337529239d65a86b2ce2e69e38d3f3d414be
+source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0054 (tree 140f694ccd)
 ```
 
 Older releases and hashes: [docs/RELEASES.md](docs/RELEASES.md). Changes: [CHANGELOG.md](CHANGELOG.md).
@@ -46,18 +46,21 @@ the driver's profiler; the newest version each was tested with.
 
 | App | Game / test | API | Version | Result |
 |---|---|---|---|---|
-| Winlator | AIO Graphics Test, D3D11 cube | D3D11 (DXVK) | 1.0.0 → | ~260–270 FPS (Sarek 1.11, 1.10.3, 2.3.1); A51 (G72) 213 FPS |
+| Winlator | AIO Graphics Test, D3D11 cube | D3D11 (DXVK) | 1.0.0 → | ~260–270 FPS (Sarek 1.11, 1.10.3, 2.3.1, x86_64 container); 1.2.4, ARM64EC container: 1.10.3-async 380–550 FPS; A51 (G72) 213 FPS |
+| Winlator | AIO Graphics Test, D3D11 cube | D3D11 (DXVK 2.7.1 gplasync) | 1.2.4 | **180–230 FPS** (1.2.3: black window, device lost; first 1.2.4 build: 104 FPS). The GPU governor keeps the clock near 260 MHz for this load, 1.10.3 gets ~580 MHz |
 | Winlator | AIO Graphics Test, D3D9 cube | D3D9 (DXVK) | 1.0.0 → | ~74 FPS with Box64 Performance (5.5 FPS with Compatibility); A51 60 FPS |
 | Winlator | AIO Graphics Test, D3D12 cube | D3D12 (VKD3D-Proton 2.14.1) | 1.2.2 | cube shows |
 | Winlator | `d3d12diag` (14 draw/readback cases, presenting) | D3D12 | 1.2.2 | all pass |
 | Winlator | NieR:Automata | D3D11 (DXVK-Sarek 1.12) | 1.2.2 | **playable but slow**: ~20 FPS menus, ~10–14 FPS in game (GPU-bound vertex shading); needs `heap_memory_percent=0.42` |
+| Winlator | NieR:Automata | D3D11 (DXVK 1.10.3-async) | 1.2.4 | menu 47 FPS; one save fails to load (also on 1.2.3: Sarek gets stuck, 1.10.3 crashes in game code) |
+| Winlator | NieR:Automata | D3D11 (DXVK 2.7.1 gplasync) | 1.2.4 | intro and menu correct, one save loads and renders, **another save goes black** (GPU fault in its first heavy pass, open). Needs BCn emulation **off** |
 | Winlator | Need for Speed: Most Wanted (low) | D3D9 | 1.2.0 | runs; ~22 FPS on 1.1.0, per-draw cost cut 2.4× in 1.2.0 |
 | Winlator | Mortal Kombat Komplete Edition | D3D9, 32-bit | 1.2.2 | **crashes** (R6025 / page fault in the game under Wine WoW64; no driver errors); ~13 FPS before that |
 | Winlator | DmC: Devil May Cry | D3D9, 32-bit | 1.2.2 | **crashes** at start (R6025, same WoW64 issue) |
 | Winlator | Renderer Driver = PanVK (compositor) | Vulkan | 1.2.1 | works, 60 Hz |
 | Eden | NieR:Automata – The End of YoRHa Edition | Vulkan | 1.2.3 | **runs, no crashes** (crashed on 1.2.2) |
-| Eden | Zelda: Echoes of Wisdom | Vulkan | 1.2.3 | **playable**: 16–20 FPS with Huawei performance mode (8–12 without), some stutter; 2D menu smooth |
-| – | Vulkan CTS (dEQP-VK 1.4.7.0) | Vulkan 1.3 | 1.1.0, 1.2.3 | 94 k cases pass in a 1/10 sample of the suite (1.1.0); 1.2.3: no new failures vs 1.2.2 on the 18 848-case regression sample. [docs/CTS.md](docs/CTS.md) |
+| Eden | Zelda: Echoes of Wisdom | Vulkan | 1.2.3, 1.2.4 | **playable**: 16–20 FPS with Huawei performance mode (8–12 without), some stutter; 2D menu smooth |
+| – | Vulkan CTS (dEQP-VK 1.4.7.0) | Vulkan 1.3 | 1.1.0, 1.2.4 | 94 k cases pass in a 1/10 sample of the suite (1.1.0); 1.2.4: no new failures on 37 600 cases (regression sample, storage-buffer robustness, sync2, subgroups, buffer-to-image copies, 6 890 indirect-draw and 3 983 vertex-shader image cases; one image-robustness case failed once and passed 3/3 on its own). [docs/CTS.md](docs/CTS.md) |
 
 Per-game settings and details: [Winlator](docs/apps/winlator.md#notes-per-game),
 [Eden](docs/apps/eden.md). Tested something else? Open an issue with the app, game,
@@ -65,7 +68,7 @@ driver version and what you saw.
 
 ## Driver at a glance
 
-| | Previous Kirin 990 Winlator pack | This driver (1.2.3) |
+| | Previous Kirin 990 Winlator pack | This driver (1.2.4) |
 |---|---|---|
 | DXVK 2.x requirements (robustness2, nullDescriptor, …) | missing | all 56 hard requirements present |
 | Geometry shaders / tessellation / transform feedback | advertised but not implemented (GPU hang) | implemented (emulated), tests pass |
@@ -80,7 +83,7 @@ driver version and what you saw.
 | SoC / GPU | Kirin 990 / Mali-G76 MC16 (Bifrost, arch v7) |
 | Android | 10 (EMUI 12), API 29, kernel 4.14.116 |
 | Kernel GPU driver | stock `mali_kbase`, JM, uAPI 11.16 (56-byte atoms) |
-| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.2.3 (Mesa 26.3.0-devel)`, Vulkan 1.3.363, 165 device extensions |
+| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.2.4 (Mesa 26.3.0-devel)`, Vulkan 1.3.363, 165 device extensions |
 
 Also checked on a Galaxy A51 (Exynos 9611, Mali-G72 MP3, AOSP 16, kbase uAPI 11.35):
 same build runs; all tests pass (see *Results*).
@@ -150,6 +153,15 @@ requests linear buffers itself).
 | 0043 | Barriers with nothing to wait for (destination stage only TOP_OF_PIPE, or source only BOTTOM_OF_PIPE) no longer end the batch. `panvk_env.txt` is also read from `/sdcard/Android/data/<package>/files/`. Profiler: why batches were split, slow shader compiles. |
 | **0044** | **Eden NieR:Automata crash**: the large-workgroup split (0012) refused shaders with subgroup operations, so 1024-invocation workgroups ran unsplit on the G76 (wrong results, then a GPU fault). `gl_SubgroupID` / `gl_NumSubgroups` are now rewritten per logical invocation and such shaders are split. |
 | 0045 | Profiler: on the first failed GPU job, log the last 128 jobs (kind, duration, result). |
+| 0046 | Bindless (update-after-bind) textures and samplers indexed set memory from one device-constant base with a 32-bit index; in Wine/FEX processes descriptor pools land more than 64 GiB away. The base is now per draw/dispatch, from the bound sets. `PANVK_VA_HOLE_GB=n` reproduces the placement in tests. |
+| **0047** | **DXVK 2.4+ black window / lost device**: an indexed draw without vertex buffers (DXVK 2.x pulls vertices from a texel buffer) made a zero-sized allocation, read as out of memory, and the VS image attribute table stayed NULL. |
+| 0048 | Job decoder: bindless texture/sampler tables are not decoded. |
+| **0049** | **Indexed indirect draws** (DXVK 2.7 records D3D11 draws this way) got a WRITE_VALUE, a 64-workgroup index search sized by the whole index buffer and a helper job: now one fused job, batched per batch. AIO D3D11 with DXVK 2.7.1: 104 → ~190 FPS. |
+| 0050 | Non-indexed indirect draws join the batch's helper job: 0.22–0.27 → 0.05 ms per draw on the benchmark. |
+| 0051 | Profiler: every draw counted, render pass size, attachments and load ops in the batch kind. |
+| 0052 | A vertex-pulling VS with storage images or texel buffers reuses its image tables while the VS and descriptors are unchanged (no copy job per draw). |
+| **0053** | **Buffer-to-image copies that read past their source** are clipped to the rows that exist: the copy shader has no source bounds and the memory after a buffer is often unmapped on kbase (lost device). Hit by Winlator's BCn emulation with DXVK 2.7. |
+| 0054 | Job decoder: flags attribute buffers outside known memory, prints push uniforms. |
 | 0005, 0006, 0008, 0009, 0011, 0013–0018 | Diagnostics (off unless enabled in `panvk_env.txt`): swapchain pixel check, extension hiding, failed-job batch description, GPU-time profiler, wait/latency statistics. |
 
 Not in this series but required for Winlator: Android-only WSI (`-Dplatforms=android`).
@@ -184,6 +196,13 @@ swapchain and every DXVK version fails at `vkAcquireNextImageKHR`.
    D3D9 bottleneck in emulated code, not the driver) and the kernel log.
 
 ## Known issues / next steps
+
+- **NieR:Automata with DXVK 2.7.1**: one save goes black (GPU fault in its first heavy pass,
+  ~850 draws; cause not found; 1.2.4's draw changes are not it). Use DXVK-Sarek 1.12 or
+  1.10.3 for NieR. Set Winlator's **BCn emulation to None** for PanVK containers.
+- **DXVK 2.7 is ~2× slower than DXVK 1.10 / Sarek** in the AIO test (180–230 vs 380–550 FPS):
+  more GPU work per frame (indirect draws, vertex pulling, more passes and queries), and the
+  Huawei governor clocks the GPU at ~260 MHz for it instead of ~580 MHz.
 
 - **Eden: Zelda: Echoes of Wisdom is GPU-bound** (16–20 FPS): the emulator issues ~85 render
   passes per frame, three quarters with one draw, and each pass loads and stores its tiles.
@@ -241,7 +260,7 @@ Failed GPU jobs are always logged (`panvk: failed atom N ran: …`).
 ```bash
 export ANDROID_NDK_ROOT=/path/to/android-ndk-r30
 scripts/prepare-tree.sh work          # Mesa 5a07217f + zenithblue series + patches/
-scripts/build-android.sh work 1.2.3   # → work/dist/panvk-g76-kirin990-1.2.3.zip
+scripts/build-android.sh work 1.2.4   # → work/dist/panvk-g76-kirin990-1.2.4.zip
 scripts/build-tests.sh work           # → out/tests, out/probes
 scripts/deploy-tests.sh work/dist/libvulkan_panfrost.so
 adb shell sh /data/local/tmp/run-tests.sh /data/local/tmp/drv
@@ -260,7 +279,9 @@ with `MESA_SPIRV_DUMP_PATH` on a host drm-shim build, or benchmark it on the pho
 against the vendor driver; compute mode with `SPVCOMP_FILL` / `SPVCOMP_GROUPS`),
 `tests/tools/lwgtest/` (1024-invocation workgroup with subgroup operations, shared memory
 and barriers), `tests/tools/gsreplay/` (geometry-shader emulation replay),
-`tests/tools/fmtprobe.c` (format feature dump).
+`tests/tools/fmtprobe.c` (format feature dump), `tests/stress/vpull.c` (DXVK 2.x-style
+draws: vertex pulling from a texel buffer, indexed or non-indexed indirect, large shared
+index buffers).
 
 Host requirements: meson, ninja, python3 (mako, pyyaml), LLVM + clang + libclc +
 SPIRV-LLVM-Translator (for Mesa's host code generators), glslang, xxd.

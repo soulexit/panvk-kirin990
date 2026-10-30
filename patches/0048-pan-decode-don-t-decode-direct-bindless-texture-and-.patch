@@ -1,0 +1,47 @@
+From 0e2ee3df576c0757100a4d96a825e65fdc1b7788 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Thu, 29 Oct 2026 19:05:35 +0300
+Subject: [PATCH 48/54] pan/decode: don't decode direct (bindless) texture and
+ sampler tables
+
+A count of 65535 marks a table indexed from a base that need not be
+mapped; decoding it aborted the dump.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/genxml/decode_jm.c | 18 ++++++++++++++----
+ 1 file changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/src/panfrost/genxml/decode_jm.c b/src/panfrost/genxml/decode_jm.c
+index 4fab8b7..f01891b 100644
+--- a/src/panfrost/genxml/decode_jm.c
++++ b/src/panfrost/genxml/decode_jm.c
+@@ -375,11 +375,21 @@ GENX(pandecode_dcd)(struct pandecode_context *ctx, const struct MALI_DRAW *p,
+    } else if (uniform_count)
+       pandecode_log(ctx, "// XXX: Uniforms referenced but not specified\n");
+ 
+-   if (p->textures)
+-      pandecode_textures(ctx, p->textures, texture_count);
++   if (p->textures) {
++      /* 65535: a direct (bindless) table, indexed relative to a base that
++       * need not be mapped; nothing to decode. */
++      if (texture_count == UINT16_MAX)
++         pandecode_log(ctx, "Textures %" PRIx64 ": direct\n", p->textures);
++      else
++         pandecode_textures(ctx, p->textures, texture_count);
++   }
+ 
+-   if (p->samplers)
+-      pandecode_samplers(ctx, p->samplers, sampler_count);
++   if (p->samplers) {
++      if (sampler_count == UINT16_MAX)
++         pandecode_log(ctx, "Samplers %" PRIx64 ": direct\n", p->samplers);
++      else
++         pandecode_samplers(ctx, p->samplers, sampler_count);
++   }
+ }
+ 
+ static void
+-- 
+2.43.0
+

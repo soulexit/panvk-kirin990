@@ -42,7 +42,10 @@
    X(CmdSetViewport) X(CmdSetScissor) X(CmdEndRenderPass)                      \
    X(CmdCopyImageToBuffer) X(CmdPipelineBarrier) X(EndCommandBuffer)           \
    X(CreateFence) X(QueueSubmit) X(WaitForFences) X(ResetFences)               \
-   X(DestroyPipeline) X(DestroyShaderModule)
+   X(DestroyPipeline) X(DestroyShaderModule)                                 \
+   X(CreateDescriptorSetLayout) X(CreateDescriptorPool)                        \
+   X(AllocateDescriptorSets) X(UpdateDescriptorSets) X(CreateBufferView)       \
+   X(CmdBindDescriptorSets)
 
 #define DX7_DECL(n) static PFN_vk##n vk##n;
 DX7_FUNCS(DX7_DECL)
@@ -293,6 +296,7 @@ struct dx7_pipe_desc {
    uint32_t vertex_stride;
    int primitive_restart;
    int rasterizer_discard;
+   int no_vertex_input; /* vertex pulling: no bindings or attributes */
 };
 
 static VkPipeline
@@ -328,9 +332,9 @@ dx7_pipeline(struct dx7 *t, const struct dx7_pipe_desc *d)
    VkVertexInputAttributeDescription va = {0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0};
    VkPipelineVertexInputStateCreateInfo vi = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-      .vertexBindingDescriptionCount = 1,
+      .vertexBindingDescriptionCount = d->no_vertex_input ? 0 : 1,
       .pVertexBindingDescriptions = &vb,
-      .vertexAttributeDescriptionCount = 1,
+      .vertexAttributeDescriptionCount = d->no_vertex_input ? 0 : 1,
       .pVertexAttributeDescriptions = &va};
    VkPipelineInputAssemblyStateCreateInfo ia = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,

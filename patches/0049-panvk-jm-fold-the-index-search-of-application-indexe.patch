@@ -1,0 +1,61 @@
+From 7c12f0b0fb49149399c1d85d9458890c88aa89b9 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Thu, 29 Oct 2026 19:31:00 +0300
+Subject: [PATCH 49/54] panvk/jm: fold the index search of application indexed
+ indirect draws
+
+An indexed indirect draw's count is only known on the GPU, so it got a
+WRITE_VALUE, a min/max search sized by the whole index buffer (up to 64
+workgroups) and the indirect helper: three jobs per draw. DXVK 2.7
+records its D3D11 draws as one-command indirect draws into large shared
+index buffers, so this was most of a frame (AIO D3D11 test: 4.6 ms of
+vertex/tiler time for ~20 draws, 104 FPS).
+
+The fused helpers already read the count from the command, so they are
+correct for any size: application indirect draws (no in-batch producer)
+now use them, batched per batch when hoisted. vpull benchmark, 20 small
+indirect draws into a 4 MB index buffer: 0.18-0.22 -> 0.06-0.13 ms per
+draw; one 1M-index indirect draw is ~20 % slower (one workgroup).
+PANVK_V7_INDIRECT_FOLD=0 keeps the separate search.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 523a226..be36e86 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -3397,9 +3397,25 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+    const uint32_t fold_max = hoist && batch_minmax
+                                 ? PANVK_V7_MINMAX_BATCH_FOLD_MAX
+                                 : PANVK_V7_MINMAX_FOLD_MAX;
+-   const bool fold_minmax = minmax_mode == 2 && draw->info.index.index_size &&
+-                            draw->cpu_count && draw->cpu_count <= fold_max &&
+-                            !vs->info.writes_global;
++   /* An application's indexed indirect draw folds too: its count is only
++    * known on the GPU, where the helper reads it, so one workgroup searches
++    * whatever the size, instead of a WRITE_VALUE, a search sized by the whole
++    * index buffer and a helper job (DXVK 2.7 records its D3D11 draws as
++    * one-command indirect draws into large shared index buffers).
++    * PANVK_V7_INDIRECT_FOLD=0 keeps the separate search.
++    */
++   static int indirect_fold_knob = -1;
++   if (indirect_fold_knob < 0) {
++      const char *e = getenv("PANVK_V7_INDIRECT_FOLD");
++      indirect_fold_knob = !(e && e[0] == '0');
++   }
++   const bool app_indirect = draw->info.indirect.buffer_dev_addr != 0 &&
++                             !draw->cpu_count && !draw->indirect_dep_job;
++   const bool fold_minmax =
++      minmax_mode == 2 && draw->info.index.index_size &&
++      ((draw->cpu_count && draw->cpu_count <= fold_max) ||
++       (indirect_fold_knob && app_indirect)) &&
++      !vs->info.writes_global;
+ 
+    if (draw->info.index.index_size) {
+       const unsigned path =
+-- 
+2.43.0
+
