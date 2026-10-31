@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.2.5 (testing) — 2026-10-31
+
+**ARMSX2 (PS2) runs at full speed passes.** Kingdom Hearts: 1.2.4 5–8 FPS → **27–30 FPS**
+(Huawei's own driver: 35–41). ARMSX2 needs its own zip,
+`panvk-g76-kirin990-1.2.5-armsx2.zip` (same driver, library named `libvulkan_freedreno.so`).
+
+- **Rasterization-order attachment access on the G76** (0056). Without it PCSX2 records a
+  render-target read-back barrier before almost every draw, and each one ended the render
+  pass (~860 pass splits per second). Now PCSX2 reads the render target in the shader.
+  CTS: 122 pass, 0 fail.
+- Barriers inside a render pass that only order tile-local work no longer end the pass (0056).
+- **Overlap on by default** (0056): a pass's vertex/tiler work runs during the previous pass's
+  fragment work, with two 128 MiB tiler heap halves (0004 had turned it off with 64 MiB halves).
+  Barriers from fragment work to vertex, tessellation/geometry, compute or copy work wait for
+  the fragment job. `PANVK_OVERLAP=0` turns it off.
+- **Uniform-buffer constants in registers** for PCSX2-based emulators (0055, 0056): dynamic
+  uniform buffer words a shader reads at fixed offsets are loaded once per draw instead of per
+  pixel/vertex (−12 % GPU time on the large passes). `PANVK_V7_PUSH_UBO=1/0` forces it on/off.
+- `panvk_env.txt` works in ARMSX2 (its loader redirects `fopen()`), in
+  `/sdcard/Android/data/com.armsx2.nightly/files/` (0056).
+- New opt-in experiments: `PANVK_V7_CPU_INDEX_RANGE=1` (index ranges found on the CPU),
+  `PANVK_V7_DIRECT_TEX_ALL=1` (textures indexed straight from descriptor memory). Neither raised
+  Kingdom Hearts' frame rate.
+- Diagnostics: `PANVK_GPU_TS=1` (GPU timestamps of vertex/tiler work in the profile), CPU waits
+  by caller, `PANVK_SELFPROF=1` per thread and function, `PANVK_STDERR_FILE` works in ARMSX2.
+- Known: Kingdom Hearts waits for the GPU twice a frame (PCSX2's three command buffers); the
+  remaining gap to Huawei's driver is GPU time per pass, mostly fragment work.
+- Not yet re-checked with overlap on: NieR:Automata's heaviest scenes (if a game loses the
+  device on large frames, try `PANVK_OVERLAP=0` and report it).
+- CTS on the release build: no new failures against 1.2.4 (regression sample 18 846 pass,
+  tile barriers, rasterization order, vertex-shader images, 6 890 indirect draws,
+  buffer-to-image copies, descriptor indexing, mutable descriptors, sync2; uniform-buffer
+  cases 375/375 with the constant push forced on).
+
 ## 1.2.4 (testing) — 2026-10-30
 
 **DXVK 2.4 and later run** (tested: DXVK 2.7.1 gplasync, ARM64EC container).

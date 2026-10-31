@@ -250,3 +250,32 @@ uploads are BC and correct. Such copies are now clipped (0053). One save still g
 the GPU faults in its first heavy pass (~850 draws, a fragment job reports invalid data);
 not 0049-0052, not the 128 MiB tiler heap (512 MiB changed nothing). Open.
 
+
+## 11. 1.2.5: ARMSX2 (Kingdom Hearts)
+
+**5–8 FPS.** ARMSX2 loads drivers through AdrenoTools, which redirects `fopen()` into the
+driver's cache directory, so `panvk_env.txt` was never read (now `open()` + `fdopen()`).
+With the profiler on, every pass was split ~30 times: PCSX2 emulates PS2 blending by reading
+the render target, and without `VK_EXT_rasterization_order_attachment_access` it records a
+`BY_REGION | FEEDBACK_LOOP` barrier (attachment output → fragment shader read) before such
+draws; each barrier closed the batch, storing and reloading every tile. Bifrost reads the
+tile buffer in input-attachment loads, so rasterization order can be offered when forward
+pixel kill is off for those draws and depth/stencil tile reads are ordered. 5–8 → 19 FPS.
+Overlap (a pass's vertex/tiler chain during the previous fragment job) with 128 MiB heap
+halves: → 26–32 FPS.
+
+**What is left.** Hardware counters (system-wide, the vendor driver too): per frame Huawei's
+driver uses 2.1 M GPU cycles, ours 5.1 M, for the same fragment quads and texture reads.
+Huawei's driver reaches 38 FPS at 166 MHz; ours gets 29 FPS at 253 MHz, so it is GPU work, not
+the clock. A GPU-timestamp profile (`PANVK_GPU_TS=1`) found each indexed pass spending
+~0.35 ms on the batched index-range helper (one lane patching descriptors); doing the range on
+the CPU removed ~5 ms of vertex/tiler time per frame, and pushing dynamic uniform-buffer words
+into registers cut ~12 % of the large passes, but neither moved the frame rate: vertex/tiler
+work overlaps fragment work. Every CPU wait is PCSX2's `WaitForCommandBufferCompletion`
+(three command buffers, ~5 submits per frame): two waits of ~9 ms per frame. The next thing
+to measure is fragment-job cost per pass (ours ~3× the vendor driver's per job).
+
+**Found by CTS on the way:** overlap ignored barriers from fragment work to the tessellation/
+geometry emulation (fixed: the next batch waits for the fragment job), and direct texture
+indexing broke push-descriptor shaders (vk_meta blits) and a tessellated pipeline-library case
+(now opt-in).

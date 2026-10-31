@@ -10,7 +10,7 @@
 #include "vpull.vert_spv.h"
 static uint32_t ndraws, per, pull;
 static VkBuffer ib, indb;
-static int indirect, noindex;
+static int indirect, noindex, passes;
 static VkBuffer dindb;
 static VkDescriptorSet set;
 static void rec(struct dx7 *t, VkCommandBuffer cmd, void *data) {
@@ -19,6 +19,17 @@ static void rec(struct dx7 *t, VkCommandBuffer cmd, void *data) {
                               &set, 0, NULL);
    vkCmdBindIndexBuffer(cmd, ib, 0, VK_INDEX_TYPE_UINT32);
    for (uint32_t i = 0; i < ndraws; i++) {
+      if (passes && i) {
+         /* VPULL_PASSES=1: every draw in a render pass of its own. */
+         vkCmdEndRenderPass(cmd);
+         VkClearValue clear = {.color = {{0.0f, 0.0f, 1.0f, 1.0f}}};
+         VkRenderPassBeginInfo rpbi = {
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+            .renderPass = t->rp, .framebuffer = t->fb,
+            .renderArea = {{0, 0}, {RT_W, RT_H}},
+            .clearValueCount = 1, .pClearValues = &clear};
+         vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+      }
       if (noindex)
          vkCmdDrawIndirect(cmd, dindb, i * sizeof(VkDrawIndirectCommand), 1,
                            sizeof(VkDrawIndirectCommand));
@@ -41,6 +52,7 @@ int main(int argc, char **argv) {
    /* VPULL_DRAW_INDIRECT=1: non-indexed vkCmdDrawIndirect, each draw the
     * first indices_per_draw vertices of its window. */
    noindex = getenv("VPULL_DRAW_INDIRECT") != NULL;
+   passes = getenv("VPULL_PASSES") != NULL;
    const uint32_t ib_pad = getenv("VPULL_IB_PAD") ? atoi(getenv("VPULL_IB_PAD")) : 0;
    struct dx7 t; VkPhysicalDeviceFeatures want = {0};
    dx7_init(&t, argv[1], &want);

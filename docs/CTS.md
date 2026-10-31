@@ -119,3 +119,24 @@ intermittent on 1.0.0 as well.
 None of these are known to affect the games tested so far; the most likely to matter
 for D3D11 are the tessellation hang (domain shaders that write UAVs) and per-sample
 MSAA shading.
+
+### 1.2.5 release check
+
+Lists run on the 1.2.5 code (P40), compared case by case with 1.2.4:
+
+| List | Result | Against 1.2.4 |
+|---|---|---|
+| Regression sample (18 848) | 18 846 pass | same two known cases (`permuted_index.barrier`, an adjacency crash) |
+| Tile-local barriers (4 013) | 2 895 pass, 21 fail | the 21 (multisample input attachments, one feedback-loop case) fail on 1.2.4 too |
+| `rasterization_order_attachment_access` (282) | 122 pass, 0 fail, 160 not supported (MSAA) | new extension on v7 |
+| Vertex-shader images (3 983) | 19 fail | 1.2.4: 20 |
+| Indirect draws (6 890) | identical | 0 differences |
+| Buffer-to-image copies, descriptor indexing, mutable descriptors, sync2 | 0 new | one known `storage_texel_buffer_in_loop` failure |
+| UBO / dynamic-offset cases with `PANVK_V7_PUSH_UBO=1` (375) | 375 pass | — |
+
+Found and fixed during the check: overlap ignored barriers from fragment work to the
+tessellation/geometry emulation (6 `synchronization*` cases), and direct texture indexing
+lost the device with push descriptors and in one tessellated pipeline-library case (now
+opt-in). With the opt-in `PANVK_V7_CPU_INDEX_RANGE=1`,
+`indexed_draw.update_index_buffer_before_draw_32` fails as expected (indices written after
+the draw is recorded).

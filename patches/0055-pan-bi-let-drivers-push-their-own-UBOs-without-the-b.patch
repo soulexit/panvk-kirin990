@@ -1,0 +1,49 @@
+From f29ee6a3fc30babd2efd169cb3c67828caffb9bb Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Sat, 31 Oct 2026 12:06:17 +0300
+Subject: [PATCH 55/56] pan/bi: let drivers push their own UBOs without the
+ blend constants
+
+bi_opt_push_ubo() always pushed the gallium sysval UBO's blend constants
+first for fragment shaders and asserted that the FAU had no driver
+reserved range. PanVK reserves its sysvals and push constants at the
+start of the FAU and pushes dynamic uniform buffers, which hold no blend
+constants: fau.no_blend_constant_push skips them.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/compiler/bifrost/bi_opt_push_ubo.c | 3 ++-
+ src/panfrost/compiler/pan_compiler.h            | 3 +++
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/compiler/bifrost/bi_opt_push_ubo.c b/src/panfrost/compiler/bifrost/bi_opt_push_ubo.c
+index 35d15f2..70040f4 100644
+--- a/src/panfrost/compiler/bifrost/bi_opt_push_ubo.c
++++ b/src/panfrost/compiler/bifrost/bi_opt_push_ubo.c
+@@ -153,7 +153,8 @@ bi_opt_push_ubo(bi_context *ctx)
+    struct pan_fau_layout *fau = ctx->info.fau;
+ 
+    /* We first pick the blend constants, those cannot be reordered */
+-   if (ctx->stage == MESA_SHADER_FRAGMENT)
++   if (ctx->stage == MESA_SHADER_FRAGMENT &&
++       !ctx->inputs->fau.no_blend_constant_push)
+       bi_pick_blend_constants(ctx, &analysis);
+ 
+    ctx->ubo_reloc.start = fau->count;
+diff --git a/src/panfrost/compiler/pan_compiler.h b/src/panfrost/compiler/pan_compiler.h
+index b71fac1..a6d5486 100644
+--- a/src/panfrost/compiler/pan_compiler.h
++++ b/src/panfrost/compiler/pan_compiler.h
+@@ -63,6 +63,9 @@ struct pan_compile_inputs {
+       uint32_t pushable_ubos;
+       /* Whether the backend may promote immediates into the FAU */
+       bool promote_immediates;
++      /* The pushable UBOs are the driver's own (PanVK): no gallium sysval
++       * UBO holding the blend constants. */
++      bool no_blend_constant_push;
+    } fau;
+ };
+ 
+-- 
+2.43.0
+

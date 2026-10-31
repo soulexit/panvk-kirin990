@@ -35,6 +35,7 @@ spv "$ROOT/tests/stress/vpull.vert" vpull.vert
 "$CC" -O2 -w $INC -I"$OUT/gen" -I"$ROOT/tests/stress" "$ROOT/tests/stress/stress.c" -o "$OUT/tests/stress" -ldl -lm
 "$CC" -O2 -w $INC -I"$OUT/gen" -I"$ROOT/tests/stress" "$ROOT/tests/stress/idraw.c" -o "$OUT/tests/idraw" -ldl -lm
 "$CC" -O2 -w $INC -I"$OUT/gen" -I"$ROOT/tests/stress" "$ROOT/tests/stress/vpull.c" -o "$OUT/tests/vpull" -ldl -lm
+"$CC" -O2 -w $INC -I"$OUT/gen" -I"$ROOT/tests/stress" "$ROOT/tests/stress/memspeed.c" -o "$OUT/tests/memspeed" -ldl -lm
 "$CC" -O1 -w $INC -I"$OUT/gen" "$ROOT/tests/lwg/lwg.c" -o "$OUT/tests/lwg" -ldl
 "$CC" -O1 -w $INC -I"$OUT/gen" -DUSAGE_DST=0x333 "$ROOT/tests/compositor/comp.c" -o "$OUT/tests/compositor" -ldl -landroid -lnativewindow
 A="$ZB/tests/ahb"

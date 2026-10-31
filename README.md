@@ -18,13 +18,18 @@ predecessors: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kirin9
 
 ## Download
 
-Latest: **1.2.4** (pre-release), `panvk-g76-kirin990-1.2.4.zip` from
-[releases](https://github.com/soulexit/panvk-kirin990/releases).
+Latest: **1.2.5** (pre-release) from
+[releases](https://github.com/soulexit/panvk-kirin990/releases):
+`panvk-g76-kirin990-1.2.5.zip` for Winlator, Eden and other apps, and
+`panvk-g76-kirin990-1.2.5-armsx2.zip` for ARMSX2 (same driver, library named as ARMSX2 requires).
 
 ```text
-sha256:  9e09250cd1b16301a5f5cf282d6da7dfee35375b1fd2346838adfd2f78c0931a
-.so:     c92dcaf1fd8d91265930211f3ac1337529239d65a86b2ce2e69e38d3f3d414be
-source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0054 (tree 140f694ccd)
+zip:     panvk-g76-kirin990-1.2.5.zip
+sha256:  48801f8a6dc0c38afdd74845a4d4fde6735ca3e288bd142fb2de7085281ed7e6
+armsx2:  panvk-g76-kirin990-1.2.5-armsx2.zip
+sha256:  2ee9b7e9c3ac24948a28227fb504ce029bcd2a0a97693d50449e57bf39b250b8
+.so:     1ad60322e5eae6237382fb996d58061b77efa098b936cb261d20883220f2ed5d
+source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0056 (tree eac87c3b14)
 ```
 
 Older releases and hashes: [docs/RELEASES.md](docs/RELEASES.md). Changes: [CHANGELOG.md](CHANGELOG.md).
@@ -37,6 +42,7 @@ Install the zip as it is (don't unzip it) in the app's driver manager:
 |---|---|---|---|
 | **Winlator** (cmod 4.1) | Contents / driver manager; then Graphics Driver in the container | `/sdcard/Download/panvk_env.txt` | [docs/apps/winlator.md](docs/apps/winlator.md) |
 | **Eden** (Switch) | Settings → GPU driver manager | `/sdcard/Android/data/dev.legacy.eden_emulator.nightly/files/panvk_env.txt` | [docs/apps/eden.md](docs/apps/eden.md) |
+| **ARMSX2** (PS2) | GPU driver setting; use the `-armsx2` zip | `/sdcard/Android/data/com.armsx2.nightly/files/panvk_env.txt` | [docs/apps/armsx2.md](docs/apps/armsx2.md) |
 | Other AdrenoTools apps | their driver manager | `/sdcard/Download/` if the app can read it, else `/sdcard/Android/data/<package>/files/` | untested |
 
 ## Games and tests
@@ -59,16 +65,17 @@ the driver's profiler; the newest version each was tested with.
 | Winlator | DmC: Devil May Cry | D3D9, 32-bit | 1.2.2 | **crashes** at start (R6025, same WoW64 issue) |
 | Winlator | Renderer Driver = PanVK (compositor) | Vulkan | 1.2.1 | works, 60 Hz |
 | Eden | NieR:Automata – The End of YoRHa Edition | Vulkan | 1.2.3 | **runs, no crashes** (crashed on 1.2.2) |
+| ARMSX2 | Kingdom Hearts | Vulkan | 1.2.5 | **27–30 FPS** in game (1.2.4: 5–8; Huawei's driver 35–41) |
 | Eden | Zelda: Echoes of Wisdom | Vulkan | 1.2.3, 1.2.4 | **playable**: 16–20 FPS with Huawei performance mode (8–12 without), some stutter; 2D menu smooth |
-| – | Vulkan CTS (dEQP-VK 1.4.7.0) | Vulkan 1.3 | 1.1.0, 1.2.4 | 94 k cases pass in a 1/10 sample of the suite (1.1.0); 1.2.4: no new failures on 37 600 cases (regression sample, storage-buffer robustness, sync2, subgroups, buffer-to-image copies, 6 890 indirect-draw and 3 983 vertex-shader image cases; one image-robustness case failed once and passed 3/3 on its own). [docs/CTS.md](docs/CTS.md) |
+| – | Vulkan CTS (dEQP-VK 1.4.7.0) | Vulkan 1.3 | 1.1.0, 1.2.4, 1.2.5 | 94 k cases pass in a 1/10 sample of the suite (1.1.0); 1.2.4: no new failures on 37 600 cases (regression sample, storage-buffer robustness, sync2, subgroups, buffer-to-image copies, 6 890 indirect-draw and 3 983 vertex-shader image cases; one image-robustness case failed once and passed 3/3 on its own). [docs/CTS.md](docs/CTS.md) |
 
 Per-game settings and details: [Winlator](docs/apps/winlator.md#notes-per-game),
-[Eden](docs/apps/eden.md). Tested something else? Open an issue with the app, game,
+[Eden](docs/apps/eden.md), [ARMSX2](docs/apps/armsx2.md). Tested something else? Open an issue with the app, game,
 driver version and what you saw.
 
 ## Driver at a glance
 
-| | Previous Kirin 990 Winlator pack | This driver (1.2.4) |
+| | Previous Kirin 990 Winlator pack | This driver (1.2.5) |
 |---|---|---|
 | DXVK 2.x requirements (robustness2, nullDescriptor, …) | missing | all 56 hard requirements present |
 | Geometry shaders / tessellation / transform feedback | advertised but not implemented (GPU hang) | implemented (emulated), tests pass |
@@ -83,7 +90,7 @@ driver version and what you saw.
 | SoC / GPU | Kirin 990 / Mali-G76 MC16 (Bifrost, arch v7) |
 | Android | 10 (EMUI 12), API 29, kernel 4.14.116 |
 | Kernel GPU driver | stock `mali_kbase`, JM, uAPI 11.16 (56-byte atoms) |
-| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.2.4 (Mesa 26.3.0-devel)`, Vulkan 1.3.363, 165 device extensions |
+| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.2.5 (Mesa 26.3.0-devel)`, Vulkan 1.3.363, 165 device extensions |
 
 Also checked on a Galaxy A51 (Exynos 9611, Mali-G72 MP3, AOSP 16, kbase uAPI 11.35):
 same build runs; all tests pass (see *Results*).
@@ -162,6 +169,8 @@ requests linear buffers itself).
 | 0052 | A vertex-pulling VS with storage images or texel buffers reuses its image tables while the VS and descriptors are unchanged (no copy job per draw). |
 | **0053** | **Buffer-to-image copies that read past their source** are clipped to the rows that exist: the copy shader has no source bounds and the memory after a buffer is often unmapped on kbase (lost device). Hit by Winlator's BCn emulation with DXVK 2.7. |
 | 0054 | Job decoder: flags attribute buffers outside known memory, prints push uniforms. |
+| 0055 | Compiler: drivers can push their own uniform buffers into registers without gallium's blend-constant slot. |
+| **0056** | **ARMSX2 (PCSX2):** rasterization-order attachment access on v6/v7 (PCSX2 no longer splits every pass for a render-target read-back; Kingdom Hearts 5–8 → 27–30 FPS); tile-local in-pass barriers don't split; overlap on by default with 128 MiB heap halves, barriers from fragment to vertex/compute work wait for the fragment job; dynamic uniform-buffer words pushed into registers for PCSX2-based apps; `panvk_env.txt` read without `fopen()` (AdrenoTools redirects it); opt-in CPU index ranges and direct textures; GPU-timestamp and wait-site profiling. |
 | 0005, 0006, 0008, 0009, 0011, 0013–0018 | Diagnostics (off unless enabled in `panvk_env.txt`): swapchain pixel check, extension hiding, failed-job batch description, GPU-time profiler, wait/latency statistics. |
 
 Not in this series but required for Winlator: Android-only WSI (`-Dplatforms=android`).
@@ -204,6 +213,12 @@ swapchain and every DXVK version fails at `vkAcquireNextImageKHR`.
   more GPU work per frame (indirect draws, vertex pulling, more passes and queries), and the
   Huawei governor clocks the GPU at ~260 MHz for it instead of ~580 MHz.
 
+- **ARMSX2: Kingdom Hearts 27–30 FPS vs 35–41 on Huawei's driver.** PCSX2 waits for the GPU
+  twice a frame (three command buffers in flight); our GPU time per pass is higher, mostly on
+  the fragment side. Not the clock (Huawei's driver reaches 38 FPS at 166 MHz), not memory types,
+  not the driver's CPU time.
+- **Overlap is on again (1.2.5)** with 128 MiB tiler heap halves; NieR's heaviest scenes have not
+  been re-checked with it. If large frames lose the device, try `PANVK_OVERLAP=0` and report it.
 - **Eden: Zelda: Echoes of Wisdom is GPU-bound** (16–20 FPS): the emulator issues ~85 render
   passes per frame, three quarters with one draw, and each pass loads and stores its tiles.
   Passes on the same target can't be merged (they are feedback loops: the next pass samples
@@ -238,12 +253,16 @@ the driver loads; a leading `!` overrides a variable the app already set.
 
 | Option | Effect |
 |---|---|
-| `PANVK_GPU_PROF=1` | logcat every 5 s: GPU time per kind of batch, CPU wait time, submit rate, submit→done latency, batches/s and why they were split, shader compiles over 5 ms; on the first failed job the last 128 jobs (`HIST`) |
+| `PANVK_GPU_PROF=1` | logcat every 5 s: GPU time per kind of batch, CPU wait time and the app function that waited, submit rate, submit→done latency, batches/s and why they were split, shader compiles over 5 ms; on the first failed job the last 128 jobs (`HIST`) |
+| `PANVK_GPU_TS=1` (with `PANVK_GPU_PROF=1`) | GPU timestamps around every vertex/tiler chain: the GPU's own time per kind of batch (adds a little GPU work) |
+| `PANVK_SELFPROF=1` | logcat every 5 s: where the app's threads spend CPU time (per thread, library and function) |
 | `PANVK_SPLIT_NOOP_BARRIERS=1` | A/B: no-op barriers end the batch again (before 1.2.3) |
 | `PANVK_G76_DIAG=1` | log whether the imported swapchain buffers contain non-black pixels |
 | `PANVK_HIDE_EXTS=VK_EXT_a,VK_KHR_b` | hide device extensions |
 | `MESA_SPIRV_DUMP_PATH=/sdcard/Download/spv` + `!MESA_SHADER_CACHE_DISABLE=true` | dump every SPIR-V shader (named by hash; failed jobs log the hash) |
-| `PANVK_OVERLAP=1` | re-enable the overlap mode (not recommended on G76) |
+| `PANVK_OVERLAP=0` | turn off the overlap of a pass's vertex/tiler work with the previous fragment work (on by default from 1.2.5) |
+| `PANVK_V7_PUSH_UBO=1` / `=0` | force uniform-buffer constants into registers on/off (default: on for PCSX2-based apps) |
+| `PANVK_V7_CPU_INDEX_RANGE=1` / `PANVK_V7_DIRECT_TEX_ALL=1` | experiments, off by default: index ranges found on the CPU (wrong if indices are written after the draw is recorded) / textures indexed straight from descriptor memory |
 | `PANVK_GRALLOC_GUESS_LINEAR=0` | refuse buffers without mapper metadata (old behaviour) |
 | `PANVK_JM_EXPORT_NOWAIT=1` | A/B only: sync-file export without waiting |
 | `heap_memory_percent=0.42` | report a smaller device heap, so DXVK keeps less memory (NieR: 0.42; at 0.35 it can't load the next area) |
@@ -251,7 +270,7 @@ the driver loads; a leading `!` overrides a variable the app already set.
 | `PANVK_V7_IDVS=0` / `PANVK_V7_BATCH_MINMAX=0` / `PANVK_V7_HOIST=0` | A/B: no IDVS / one helper job per draw / helpers in place |
 | `PANVK_V7_NO_SSBO_VEC=1` / `PANVK_V7_BRANCHY_SSBO=1` | A/B: no 16-byte merge of storage-buffer loads / guarded loads |
 | `PANVK_SSBO_VEC_LOG=1` | log per shader how many storage-buffer loads were merged |
-| `BIFROST_MESA_DEBUG=shaders` + `PANVK_STDERR_FILE=/sdcard/Download/x.txt` | dump compiled shaders from a Winlator game |
+| `BIFROST_MESA_DEBUG=shaders` + `PANVK_STDERR_FILE=/sdcard/Download/x.txt` | dump compiled shaders from a Winlator game (in ARMSX2 use a path in its `files/` directory; add `MESA_SHADER_CACHE_DISABLE=true`) |
 
 Failed GPU jobs are always logged (`panvk: failed atom N ran: …`).
 
