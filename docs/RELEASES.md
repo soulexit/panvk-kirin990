@@ -4,6 +4,20 @@ Every release is one AdrenoTools zip that installs in all supported apps. Downlo
 [GitHub releases](https://github.com/soulexit/panvk-kirin990/releases). Up to 1.2.2 the
 versions carried a `-winlator` suffix.
 
+## 1.2.6 (pre-release)
+
+```text
+zip:     panvk-g76-kirin990-1.2.6.zip
+sha256:  2e2ac8741d9764c64f2817d5ee60c8393c284bed252ddb8662b8b014368e6a63
+armsx2:  panvk-g76-kirin990-1.2.6-armsx2.zip
+sha256:  f0b81b2a2d0c45a21a45d62ef031f36393eb4b1d2da7d0add8dfbda01d17c66c
+.so:     65eae575e6af3292100d91d7e26c52c1cce11fa0591f75e391ca29796ee57204
+libGL_memfd.so: 32100a7900cffddcc708ea4ed1b2557404b5fa26a5c9e06d0f9cd74bbf1ef4d2
+source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0057 (tree 9932fa0c18)
+```
+
+The main zip also holds `libGL_memfd.so` (Winlator OpenGL on Android 10). Driver name in app lists: `PanVK-G76-Kirin990-1.2.6`.
+
 ## 1.2.5 (pre-release)
 
 ```text

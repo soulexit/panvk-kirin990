@@ -18,18 +18,20 @@ predecessors: [`panvk-kirin990-termux`](https://github.com/soulexit/panvk-kirin9
 
 ## Download
 
-Latest: **1.2.5** (pre-release) from
+Latest: **1.2.6** (pre-release) from
 [releases](https://github.com/soulexit/panvk-kirin990/releases):
-`panvk-g76-kirin990-1.2.5.zip` for Winlator, Eden and other apps, and
-`panvk-g76-kirin990-1.2.5-armsx2.zip` for ARMSX2 (same driver, library named as ARMSX2 requires).
+`panvk-g76-kirin990-1.2.6.zip` for Winlator, Eden and other apps (includes `libGL_memfd.so` for
+Winlator's OpenGL on Android 10), and `panvk-g76-kirin990-1.2.6-armsx2.zip` for ARMSX2 (same
+driver, library named as ARMSX2 requires).
 
 ```text
-zip:     panvk-g76-kirin990-1.2.5.zip
-sha256:  48801f8a6dc0c38afdd74845a4d4fde6735ca3e288bd142fb2de7085281ed7e6
-armsx2:  panvk-g76-kirin990-1.2.5-armsx2.zip
-sha256:  2ee9b7e9c3ac24948a28227fb504ce029bcd2a0a97693d50449e57bf39b250b8
-.so:     1ad60322e5eae6237382fb996d58061b77efa098b936cb261d20883220f2ed5d
-source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0056 (tree eac87c3b14)
+zip:     panvk-g76-kirin990-1.2.6.zip
+sha256:  2e2ac8741d9764c64f2817d5ee60c8393c284bed252ddb8662b8b014368e6a63
+armsx2:  panvk-g76-kirin990-1.2.6-armsx2.zip
+sha256:  f0b81b2a2d0c45a21a45d62ef031f36393eb4b1d2da7d0add8dfbda01d17c66c
+.so:     65eae575e6af3292100d91d7e26c52c1cce11fa0591f75e391ca29796ee57204
+libGL_memfd.so: 32100a7900cffddcc708ea4ed1b2557404b5fa26a5c9e06d0f9cd74bbf1ef4d2
+source:  Mesa 5a07217f + zenithblue 917b9b3b series + patches/0001-0057 (tree 9932fa0c18)
 ```
 
 Older releases and hashes: [docs/RELEASES.md](docs/RELEASES.md). Changes: [CHANGELOG.md](CHANGELOG.md).
@@ -40,7 +42,7 @@ Install the zip as it is (don't unzip it) in the app's driver manager:
 
 | App | Where | Driver options file | Guide |
 |---|---|---|---|
-| **Winlator** (cmod 4.1) | Contents / driver manager; then Graphics Driver in the container | `/sdcard/Download/panvk_env.txt` | [docs/apps/winlator.md](docs/apps/winlator.md) |
+| **Winlator** (cmod 4.1) | Contents / driver manager; then Graphics Driver in the container (OpenGL on Android 10: set `BOX64_LIBGL`, see the guide) | `/sdcard/Download/panvk_env.txt` | [docs/apps/winlator.md](docs/apps/winlator.md) |
 | **Eden** (Switch) | Settings → GPU driver manager | `/sdcard/Android/data/dev.legacy.eden_emulator.nightly/files/panvk_env.txt` | [docs/apps/eden.md](docs/apps/eden.md) |
 | **ARMSX2** (PS2) | GPU driver setting; use the `-armsx2` zip | `/sdcard/Android/data/com.armsx2.nightly/files/panvk_env.txt` | [docs/apps/armsx2.md](docs/apps/armsx2.md) |
 | Other AdrenoTools apps | their driver manager | `/sdcard/Download/` if the app can read it, else `/sdcard/Android/data/<package>/files/` | untested |
@@ -55,6 +57,7 @@ the driver's profiler; the newest version each was tested with.
 | Winlator | AIO Graphics Test, D3D11 cube | D3D11 (DXVK) | 1.0.0 → | ~260–270 FPS (Sarek 1.11, 1.10.3, 2.3.1, x86_64 container); 1.2.4, ARM64EC container: 1.10.3-async 380–550 FPS; A51 (G72) 213 FPS |
 | Winlator | AIO Graphics Test, D3D11 cube | D3D11 (DXVK 2.7.1 gplasync) | 1.2.4 | **180–230 FPS** (1.2.3: black window, device lost; first 1.2.4 build: 104 FPS). The GPU governor keeps the clock near 260 MHz for this load, 1.10.3 gets ~580 MHz |
 | Winlator | AIO Graphics Test, D3D9 cube | D3D9 (DXVK) | 1.0.0 → | ~74 FPS with Box64 Performance (5.5 FPS with Compatibility); A51 60 FPS |
+| Winlator | AIO Graphics Test, OpenGL cube | OpenGL (Zink) | 1.2.6 | **104 FPS**, no glitches (before 1.2.6 OpenGL was unavailable on Android 10; needs `BOX64_LIBGL`, see the [Winlator guide](docs/apps/winlator.md#opengl-zink-on-android-10)) |
 | Winlator | AIO Graphics Test, D3D12 cube | D3D12 (VKD3D-Proton 2.14.1) | 1.2.2 | cube shows |
 | Winlator | `d3d12diag` (14 draw/readback cases, presenting) | D3D12 | 1.2.2 | all pass |
 | Winlator | NieR:Automata | D3D11 (DXVK-Sarek 1.12) | 1.2.2 | **playable but slow**: ~20 FPS menus, ~10–14 FPS in game (GPU-bound vertex shading); needs `heap_memory_percent=0.42` |
@@ -75,7 +78,7 @@ driver version and what you saw.
 
 ## Driver at a glance
 
-| | Previous Kirin 990 Winlator pack | This driver (1.2.5) |
+| | Previous Kirin 990 Winlator pack | This driver (1.2.6) |
 |---|---|---|
 | DXVK 2.x requirements (robustness2, nullDescriptor, …) | missing | all 56 hard requirements present |
 | Geometry shaders / tessellation / transform feedback | advertised but not implemented (GPU hang) | implemented (emulated), tests pass |
@@ -90,7 +93,7 @@ driver version and what you saw.
 | SoC / GPU | Kirin 990 / Mali-G76 MC16 (Bifrost, arch v7) |
 | Android | 10 (EMUI 12), API 29, kernel 4.14.116 |
 | Kernel GPU driver | stock `mali_kbase`, JM, uAPI 11.16 (56-byte atoms) |
-| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.2.5 (Mesa 26.3.0-devel)`, Vulkan 1.3.363, 165 device extensions |
+| Driver identity | `panvk`, `PanVK-kbase G76-k990 1.2.6 (Mesa 26.3.0-devel)`, Vulkan 1.3.363, 165 device extensions |
 
 Also checked on a Galaxy A51 (Exynos 9611, Mali-G72 MP3, AOSP 16, kbase uAPI 11.35):
 same build runs; all tests pass (see *Results*).
@@ -171,6 +174,7 @@ requests linear buffers itself).
 | 0054 | Job decoder: flags attribute buffers outside known memory, prints push uniforms. |
 | 0055 | Compiler: drivers can push their own uniform buffers into registers without gallium's blend-constant slot. |
 | **0056** | **ARMSX2 (PCSX2):** rasterization-order attachment access on v6/v7 (PCSX2 no longer splits every pass for a render-target read-back; Kingdom Hearts 5–8 → 27–30 FPS); tile-local in-pass barriers don't split; overlap on by default with 128 MiB heap halves, barriers from fragment to vertex/compute work wait for the fragment job; dynamic uniform-buffer words pushed into registers for PCSX2-based apps; `panvk_env.txt` read without `fopen()` (AdrenoTools redirects it); opt-in CPU index ranges and direct textures; GPU-timestamp and wait-site profiling. |
+| 0057 | The driver logs the directory it was loaded from (for `BOX64_LIBGL`, Winlator OpenGL on Android 10). |
 | 0005, 0006, 0008, 0009, 0011, 0013–0018 | Diagnostics (off unless enabled in `panvk_env.txt`): swapchain pixel check, extension hiding, failed-job batch description, GPU-time profiler, wait/latency statistics. |
 
 Not in this series but required for Winlator: Android-only WSI (`-Dplatforms=android`).

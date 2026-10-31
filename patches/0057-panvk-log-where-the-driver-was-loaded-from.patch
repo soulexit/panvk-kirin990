@@ -1,0 +1,50 @@
+From 49690a8ee79eab078b7e6f5ca832e921ecb228a2 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Sat, 31 Oct 2026 14:23:03 +0300
+Subject: [PATCH] panvk: log where the driver was loaded from
+
+AdrenoTools apps unpack the driver zip into a private directory whose
+name comes from the zip's meta.json. Helper libraries shipped in the
+same zip (libGL_memfd.so, which lets Winlator's libGL load on Android
+10) are next to the driver, and users need that path for
+BOX64_LIBGL: the driver logs it once at load.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_instance.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index db859ad..3f0c1a0 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -19,6 +19,7 @@
+ #include "util/u_call_once.h"
+ 
+ #if defined(HAVE_PAN_KMOD_KBASE)
++#include <dlfcn.h>
+ #include <fcntl.h>
+ #include <limits.h>
+ #include <stdio.h>
+@@ -311,6 +312,18 @@ panvk_env_fopen(const char *path)
+ static void __attribute__((constructor))
+ panvk_load_env_file(void)
+ {
++   /* Where the app unpacked the driver: helper libraries shipped in the
++    * same zip (libmemfd.so for Winlator's OpenGL on Android 10) are next
++    * to it. */
++   {
++      static bool logged;
++      Dl_info info;
++      if (!logged && dladdr((void *)panvk_load_env_file, &info) &&
++          info.dli_fname) {
++         logged = true;
++         mesa_logi("panvk: driver loaded from %s", info.dli_fname);
++      }
++   }
+    const char *src = "/sdcard/Download/panvk_env.txt";
+    char path[256];
+    /* open() + fdopen(): AdrenoTools' loader (ARMSX2) hooks fopen() and
+-- 
+2.43.0
+

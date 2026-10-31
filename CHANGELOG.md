@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.6 (testing) — 2026-10-31
+
+**OpenGL in Winlator on Android 10.** Winlator's OpenGL (Zink on PanVK) didn't load on the P40:
+its `libGL.so.1` needs `memfd_create()`, which Android 10's C library lacks. The zip now
+contains `libGL_memfd.so`, which provides it and loads Winlator's libGL; set
+`BOX64_LIBGL` to its path in the container ([Winlator guide](docs/apps/winlator.md#opengl-zink-on-android-10)).
+AIO OpenGL cube: 104 FPS, no glitches.
+
+- The driver's name in app driver lists is now `PanVK-G76-Kirin990-<version>` (no spaces, so
+  the unpacked directory can be used in an environment variable).
+- The driver logs the directory it was loaded from (`panvk: driver loaded from ...`).
+- Driver otherwise identical to 1.2.5 (patch 0057 only adds the log line).
+
 ## 1.2.5 (testing) — 2026-10-31
 
 **ARMSX2 (PS2) runs at full speed passes.** Kingdom Hearts: 1.2.4 5–8 FPS → **27–30 FPS**

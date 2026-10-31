@@ -279,3 +279,22 @@ to measure is fragment-job cost per pass (ours ~3× the vendor driver's per job)
 geometry emulation (fixed: the next batch waits for the fragment job), and direct texture
 indexing broke push-descriptor shaders (vk_meta blits) and a tessellated pipeline-library case
 (now opt-in).
+
+## 12. 1.2.6: OpenGL in Winlator (Zink)
+
+AIO Graphics Test showed OpenGL as unavailable. Winlator's own log
+(`/sdcard/Winlator/logs/`) of a game that used WineD3D had the cause: `Error initializing
+native libGL.so.1 (dlopen failed: cannot locate symbol "memfd_create" referenced by
+.../imagefs/usr/lib/libxshmfence.so.1.0.0)`, then `err:wgl:init_opengl OpenGL support is
+disabled`. Bionic exports `memfd_create` from API 30; the P40 is API 29, while its 4.14 kernel
+has the system call. Winlator replaces `LD_PRELOAD` with its own list, but box64 takes the
+libGL to load from `BOX64_LIBGL`: `libGL_memfd.so` defines `memfd_create()` (system call) and
+has Winlator's `libGL.so.1` as a `DT_NEEDED` entry by absolute path. It is the root of the
+load, so libxshmfence's reference resolves to it, and box64's lookups of GL entry points reach
+the real libGL through the dependency. It ships in the driver zip because apps unpack the zip
+into their private directory, where libraries can be loaded.
+
+AIO OpenGL cube: 104 FPS. The GPU has work ~half the time; per frame the process waits for
+the GPU ~6 times in Winlator's `libvulkan_wrapper.so` (~1.7 ms each) and ~3 times in Zink.
+Each frame also has a full-window compute pass (~0.8 ms) and the cube goes through the
+geometry-shader emulation (Zink emulates quads with a geometry shader).

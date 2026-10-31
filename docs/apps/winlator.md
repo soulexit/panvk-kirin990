@@ -14,8 +14,8 @@ These are the settings all results below were measured with (Winlator cmod 4.1).
 
 | Setting | Value | Why |
 |---|---|---|
-| **Graphics Driver** | `PanVK G76 Kirin 990 1.2.4` | the game renders with PanVK |
-| **Renderer Driver** | **System** or `PanVK G76 Kirin 990 1.2.4` | Winlator's screen compositor. Up to 1.2.0 PanVK gave a black screen here (fixed in 1.2.1, patch 0039); System still works and keeps the compositor off PanVK. |
+| **Graphics Driver** | `PanVK-G76-Kirin990-1.2.6` (1.2.5 and older: `PanVK G76 Kirin 990 <version>`) | the game renders with PanVK |
+| **Renderer Driver** | **System** or `PanVK-G76-Kirin990-1.2.6` | Winlator's screen compositor. Up to 1.2.0 PanVK gave a black screen here (fixed in 1.2.1, patch 0039); System still works and keeps the compositor off PanVK. |
 | **Box64 preset** (x86_64 containers) | **Performance** | COMPATIBILITY enables `BOX64_DYNAREC_STRONGMEM=1`: every emulated memory access gets a barrier. The AIO D3D9 test spent 99 % of its CPU time in one emulated byte-swizzle loop (profiled with `simpleperf`, PanVK was 0.17 %). Performance: D3D9 12 → 60 FPS (A51), 5.5 → ~74 FPS (P40). Use COMPATIBILITY only for a game that breaks. |
 | **FEXCore preset** (ARM64EC containers) | the fastest one / TSO off | same effect as STRONGMEM above |
 | **DXVK** | DXVK-Sarek 1.11/1.12/1.14, DXVK 1.10.3(-async), DXVK 2.3.1, DXVK 2.7.1 gplasync (1.2.4) tested | DXVK 2.x needs robustness2 / null descriptors — present. DXVK 2.4 and later: 1.2.4 or newer (black window before). Older DXVK is still faster here (see *Results*) |
@@ -27,6 +27,31 @@ Optional driver options can be set without rebuilding through a text file read a
 driver load, `/sdcard/Download/panvk_env.txt`, or for apps without storage access (Eden)
 `/sdcard/Android/data/<package>/files/panvk_env.txt` (see *Diagnostics*). Leave it absent or
 empty for normal use.
+
+## OpenGL (Zink) on Android 10
+
+Winlator's OpenGL is Mesa's Zink (OpenGL on Vulkan), so it renders with PanVK. On Android 10
+(the P40) it was missing: Winlator's `libGL.so.1` needs `libxshmfence`, which calls
+`memfd_create()`, and Android's C library has that function only from Android 11. The log
+said `cannot locate symbol "memfd_create"` and Wine reported `OpenGL support is disabled`.
+
+From 1.2.6 the zip contains `libGL_memfd.so` ([source](../../tools/winlator-gl/)): it
+provides `memfd_create()` (the kernel has the system call) and loads Winlator's real
+`libGL.so.1`. To use it, in the container (or shortcut) settings:
+
+1. **Graphics Driver**: `PanVK-G76-Kirin990-1.2.6`, and **Zink** for OpenGL.
+2. **Environment Variables** → add `BOX64_LIBGL` with the value (one line, no spaces):
+
+   ```text
+   /data/data/com.winlator.cmod/files/contents/adrenotools/PanVK-G76-Kirin990-1.2.6/libGL_memfd.so
+   ```
+
+   The directory is named after the driver version: after updating the driver, change the
+   version in this path too. Remove the variable to go back.
+
+Android 11 and newer don't need this. Tested: AIO Graphics Test, OpenGL cube **104 FPS**,
+no glitches (it waits for the GPU ~9 times a frame, two thirds in Winlator's Vulkan wrapper;
+see FINDINGS §12).
 
 ## Results
 
