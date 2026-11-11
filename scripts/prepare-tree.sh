@@ -28,4 +28,16 @@ git -C "$WORK/mesa" apply --index --whitespace=nowarn \
    "$ROOT"/patches/base/zenithblue-jm-v7-series-on-mesa-a379b735.patch
 git -C "$WORK/mesa" commit -q -m "zenithblue jm-v7 series on Mesa a379b735"
 git -C "$WORK/mesa" am -q "$ROOT"/patches/00*.patch
+
+# Opt-in compatibility for Huawei Mali-G76 (Kirin 990) on HarmonyOS 4.2.
+# Default builds, other GPUs and the ordinary 1.3.0 release remain unchanged.
+# Run: PANVK_H42_G76_COMPAT=1 sh scripts/prepare-tree.sh work
+if [ "${PANVK_H42_G76_COMPAT:-0}" = "1" ]; then
+  python3 "$ROOT/harmony42/apply_atom72.py" \
+    "$WORK/mesa/src/panfrost/lib/kmod/kbase_kmod.c"
+  python3 "$ROOT/harmony42/apply_rotation_compat.py" \
+    "$WORK/mesa/src/panfrost/vulkan/panvk_physical_device.c"
+  echo "H42: applied Huawei G76 Atom72 and swapchain rotation compatibility"
+fi
+
 echo "OK tree=$WORK/mesa head=$(git -C "$WORK/mesa" rev-parse --short HEAD) tree-id=$(git -C "$WORK/mesa" rev-parse --short HEAD^{tree})"
