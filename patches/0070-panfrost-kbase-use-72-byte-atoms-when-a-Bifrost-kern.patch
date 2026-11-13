@@ -1,0 +1,55 @@
+From 817dc8ab9d819fa289f5a9c0b8f113c088017585 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Thu, 12 Nov 2026 20:27:27 +0300
+Subject: [PATCH] panfrost/kbase: use 72-byte atoms when a Bifrost kernel
+ refuses stride 64
+
+Huawei's kbase on kernel 5.10 (HarmonyOS 4.2 / EMUI 12, uAPI 11.38)
+accepts the 72-byte layout probe like MediaTek's, but refuses every
+stride-64 submit with EINVAL, so nothing is drawn. After the probe picks
+64 on Bifrost, submit one dependency-only atom at 64 and switch to the
+full 72-byte atom (seq_nr + base_jd_atom_v2 + frame_nr) if it is refused.
+MediaTek kernels keep stride 64; stock kernels never reach this check.
+
+Found by dissidius (soulexit/panvk-kirin990#8, #9).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/lib/kmod/kbase_kmod.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 2eb791e8d51..456ce0af58a 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -2046,6 +2046,27 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
+        pan_arch(raw_id & 0xffffffffu) < 9)
+       atom_stride = kbase_check_bifrost_atom_stride(fd, &atom_seq_nr);
+ 
++   /* Bifrost kernels that accepted the 72-byte probe: MediaTek's kbase
++    * also takes stride 64 (base_jd_atom_v2 + frame_nr), but Huawei's
++    * kbase on kernel 5.10 (HarmonyOS 4.2 / EMUI 12, uAPI 11.38) refuses
++    * every stride-64 submit with EINVAL and only takes the full 72-byte
++    * atom (seq_nr + base_jd_atom_v2 + frame_nr): black screen with sound.
++    * Check 64 with one dependency-only atom and use 72 if it is refused.
++    * Found by dissidius (soulexit/panvk-kirin990#8, #9). */
++   if (!is_csf && atom_stride == 64 && !atom_seq_nr && raw_id &&
++       pan_arch(raw_id & 0xffffffffu) < 9 &&
++       !kbase_try_atom_stride(fd, 64, false)) {
++      if (kbase_try_atom_stride(fd, 72, true)) {
++         atom_stride = 72;
++         atom_seq_nr = true;
++         mesa_logi("kbase: Bifrost JM atom stride 64 refused, stride 72 "
++                   "(seq_nr + base_jd_atom_v2 + frame_nr)");
++      } else {
++         mesa_logw("kbase: Bifrost JM atom strides 64 and 72 refused, "
++                   "keeping 64");
++      }
++   }
++
+    struct kbase_kmod_dev *kbase_dev =
+       pan_kmod_alloc(allocator, sizeof(*kbase_dev));
+    if (!kbase_dev) {
+-- 
+2.43.0
+

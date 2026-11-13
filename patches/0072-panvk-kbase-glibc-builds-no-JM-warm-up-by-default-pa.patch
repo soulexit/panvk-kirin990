@@ -1,0 +1,72 @@
+From 9cea99dd7a09e8803740513e80930125163e31c7 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 13 Nov 2026 09:48:48 +0300
+Subject: [PATCH] panvk/kbase: glibc builds: no JM warm-up by default,
+ panvk_env.txt in ~/.config
+
+Only for non-Android (glibc) builds, Android is unchanged:
+- The 2 s JM warm-up in each process's first GPU open is off by default.
+  A Linux desktop or Steam starts dozens of processes that open the GPU
+  (DroidDeck), and the delay stalled KDE's EGL setup and Steam's web
+  helper. PANVK_KBASE_JM_WARMUP=1 turns it back on.
+- panvk_env.txt is also read from PANVK_ENV_FILE or ~/.config, since a
+  Linux system in proot may not see /sdcard.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/lib/kmod/kbase_kmod.c   | 10 +++++++++-
+ src/panfrost/vulkan/panvk_instance.c | 17 +++++++++++++++++
+ 2 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 456ce0af58a..9dadd51c768 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -1818,7 +1818,15 @@ kbase_jm_warmup(void)
+    static bool done;
+ 
+    const char *env = getenv("PANVK_KBASE_JM_WARMUP");
+-   const int mode = (env && env[0]) ? atoi(env) : 1;
++#ifdef __ANDROID__
++   const int default_mode = 1;
++#else
++   /* glibc builds (DroidDeck, glibc Winlator): a Linux desktop or Steam
++    * starts dozens of processes that each open the GPU, and 2 s in each
++    * one's first open stalled KDE's EGL setup and Steam's web helper. */
++   const int default_mode = 0;
++#endif
++   const int mode = (env && env[0]) ? atoi(env) : default_mode;
+    const char *ms_env = getenv("PANVK_KBASE_JM_WARMUP_MS");
+    int ms = (ms_env && ms_env[0]) ? atoi(ms_env) : 2000;
+    if (ms < 0 || ms > 10000)
+diff --git a/src/panfrost/vulkan/panvk_instance.c b/src/panfrost/vulkan/panvk_instance.c
+index 0a1b25a8283..e02d4b1b24e 100644
+--- a/src/panfrost/vulkan/panvk_instance.c
++++ b/src/panfrost/vulkan/panvk_instance.c
+@@ -405,6 +405,23 @@ panvk_load_env_file(void)
+    /* open() + fdopen(): AdrenoTools' loader (ARMSX2) hooks fopen() and
+     * redirects every path into the driver's private cache directory. */
+    FILE *f = panvk_env_fopen(src);
++#ifndef __ANDROID__
++   /* glibc builds run inside a Linux system (DroidDeck's proot) that may not
++    * see /sdcard: also read PANVK_ENV_FILE or ~/.config/panvk_env.txt. */
++   if (!f) {
++      const char *ef = getenv("PANVK_ENV_FILE");
++      const char *home = getenv("HOME");
++      if (ef && ef[0]) {
++         snprintf(path, sizeof(path), "%s", ef);
++      } else if (home && home[0]) {
++         snprintf(path, sizeof(path), "%s/.config/panvk_env.txt", home);
++      } else {
++         path[0] = 0;
++      }
++      if (path[0] && (f = panvk_env_fopen(path)))
++         src = path;
++   }
++#endif
+    if (!f) {
+       /* Apps without storage permission (Eden) can always read their own
+        * external files directory: /sdcard/Android/data/<package>/files. */
+-- 
+2.43.0
+

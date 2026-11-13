@@ -15,6 +15,8 @@ mkdir -p "$WORK"
 if [ ! -d "$WORK/zenithblue/.git" ]; then
   git clone -q https://github.com/zenithblue-oss/panvk-kbase-android "$WORK/zenithblue"
 fi
+# The commit is no longer on any zenithblue branch, so fetch it by hash.
+git -C "$WORK/zenithblue" fetch -q origin "$ZB_COMMIT"
 git -C "$WORK/zenithblue" checkout -q "$ZB_COMMIT"
 if [ ! -d "$WORK/mesa/.git" ]; then
   git init -q "$WORK/mesa"

@@ -1,0 +1,37 @@
+From 61e880be44398bbe0f3f3c1c2e1d870d654d7294 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Thu, 12 Nov 2026 21:10:39 +0300
+Subject: [PATCH] panvk: hide VK_EXT_physical_device_drm when there is no DRM
+ node
+
+On kbase there is no DRM primary or render node, but the extension was
+still advertised with both absent. gamescope then fails with "physical
+device has no primary node" and its Wayland backend never comes up
+(DroidDeck with the glibc build). Only offer it when a node exists.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_physical_device.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index e18608b9f51..bc817f44994 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -1714,6 +1714,13 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
+                        &supported_extensions);
+    panvk_hide_device_extensions(&supported_extensions);
+ 
++   /* kbase has no DRM primary or render node. Advertising
++    * VK_EXT_physical_device_drm with both nodes absent makes Linux
++    * compositors that check it (gamescope: "physical device has no primary
++    * node") give up on the device, so only offer it when a node exists. */
++   if (!device->drm.primary_rdev && !device->drm.render_rdev)
++      supported_extensions.EXT_physical_device_drm = false;
++
+    struct vk_features supported_features;
+    panvk_arch_dispatch(arch, get_physical_device_features, instance,
+                        device, &supported_features);
+-- 
+2.43.0
+

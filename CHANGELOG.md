@@ -1,5 +1,21 @@
 # Changelog
 
+## soulexit PanVK 1.0.001 (release page) — 2026-11-13
+
+Released on [soulexit/panvk-bifrost-soulexit](https://github.com/soulexit/panvk-bifrost-soulexit)
+only; same source as here plus patches 0070-0072 (tree `e628c01`).
+
+- **Black screen on Huawei phones with kernel 5.10** (0070), HarmonyOS 4.2 / EMUI 12 (P40 Pro,
+  Mate 30, nova 6; #3, #5, #7, #8). Their kbase accepts the 72-byte atom probe like MediaTek's but
+  refuses every 64-byte submit with EINVAL. After the probe picks 64 on Bifrost, the driver submits
+  one dependency-only atom at 64 and uses the full 72-byte atom if that is refused. Stock (56) and
+  MediaTek (64) kernels are unchanged. Found by dissidius (#9, whose opt-in build profile stays).
+- **gamescope** (0071): `VK_EXT_physical_device_drm` is no longer advertised when there is no DRM
+  node, which is always the case on kbase; gamescope gave up on the device ("no primary node").
+- **glibc builds** (0072, not released): no 2 s JM warm-up per process by default, and
+  `panvk_env.txt` is also read from `~/.config` or `PANVK_ENV_FILE`. Build: `scripts/pack-glibc.sh`.
+- `scripts/prepare-tree.sh` fetches the pinned zenithblue commit by hash (#6).
+
 ## 1.3.0 (testing) — 2026-11-11
 
 **Mesa 27.** The driver moves from Mesa 26.3-devel to Mesa main (27.0.0-devel, `a379b735`),
