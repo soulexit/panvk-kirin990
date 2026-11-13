@@ -1,0 +1,47 @@
+From 5e5848866ec4a383d646f1f468cdbd58c7fb8cdb Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 13 Nov 2026 11:47:55 +0300
+Subject: [PATCH] panvk: android: do not advertise swapchain_maintenance1
+
+On Android the platform loader owns swapchains and passes calls it does
+not implement straight to the driver, with its own VkSwapchainKHR.
+Android 16's loader does not implement vkReleaseSwapchainImagesKHR: the
+driver's WSI took the loader's swapchain for a wsi_swapchain and called a
+NULL get_wsi_image, so ARMSX2 crashed whenever the screen rotated
+(soulexit/panvk-kirin990#8, #11; reproduced on a Samsung A51). Loaders
+before Android 14 lack the EXT version too, which uses the same entry
+points. Hide both on Android; apps recreate the swapchain instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_physical_device.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index bc817f44994..ac2bd943942 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -1721,6 +1721,20 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
+    if (!device->drm.primary_rdev && !device->drm.render_rdev)
+       supported_extensions.EXT_physical_device_drm = false;
+ 
++#ifdef VK_USE_PLATFORM_ANDROID_KHR
++   /* On Android the platform loader owns swapchains (VK_ANDROID_native_buffer)
++    * and passes calls it does not implement straight to the driver with its
++    * own VkSwapchainKHR. Android 16's loader does not implement
++    * vkReleaseSwapchainImagesKHR, so the driver's WSI took the loader's
++    * swapchain object for a wsi_swapchain and called a NULL get_wsi_image:
++    * ARMSX2 crashed whenever the screen rotated (soulexit/panvk-kirin990#8,
++    * #11). Loaders before Android 14 do not implement the EXT version
++    * either, and it uses the same entry points, so hide both: apps then
++    * recreate the swapchain instead. */
++   supported_extensions.KHR_swapchain_maintenance1 = false;
++   supported_extensions.EXT_swapchain_maintenance1 = false;
++#endif
++
+    struct vk_features supported_features;
+    panvk_arch_dispatch(arch, get_physical_device_features, instance,
+                        device, &supported_features);
+-- 
+2.43.0
+

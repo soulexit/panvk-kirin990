@@ -1,0 +1,130 @@
+From 574f4b3d5e74396fc772523715d11af7fb07f1ce Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 13 Nov 2026 12:40:10 +0300
+Subject: [PATCH] panvk/jm: trim per-draw CPU cost in draw-heavy games
+
+- Cache the descriptor-copy RSD address on the device instead of looking
+  up the meta shader on every draw.
+- Pre-size the per-batch job, varying and min/max dynarrays so they don't
+  regrow during the first draws of each batch.
+- Build push-uniform blocks in a cached stack buffer and copy them to the
+  uncached descriptor memory once, instead of read-modify-writing it.
+
+In ARMSX2 (NFS Most Wanted, Mali-G72) the driver's share of the GS
+thread drops from 44.1% to 42.5%. CTS on the A51 matches 1.0.001.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../vulkan/bifrost/panvk_vX_meta_desc_copy.c    |  8 +++++++-
+ src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c    | 11 +++++++++++
+ src/panfrost/vulkan/panvk_device.h              |  6 ++++++
+ .../vulkan/panvk_vX_cmd_push_constant.c         | 17 ++++++++++++++++-
+ 4 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c b/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c
+index d58ec3c8f52..ab4b1814d1a 100644
+--- a/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c
++++ b/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c
+@@ -325,6 +325,10 @@ panvk_meta_desc_copy_rsd(struct panvk_device *dev)
+    enum panvk_meta_object_key_type key = PANVK_META_OBJECT_KEY_COPY_DESC_SHADER;
+    struct panvk_internal_shader *shader;
+ 
++   const uint64_t cached = p_atomic_read(&dev->desc_copy_rsd);
++   if (cached)
++      return cached;
++
+    VkShaderEXT shader_handle = (VkShaderEXT)vk_meta_lookup_object(
+       &dev->meta, VK_OBJECT_TYPE_SHADER_EXT, &key, sizeof(key));
+    if (shader_handle != VK_NULL_HANDLE)
+@@ -381,7 +385,9 @@ panvk_meta_desc_copy_rsd(struct panvk_device *dev)
+ 
+ out:
+    shader = panvk_internal_shader_from_handle(shader_handle);
+-   return panvk_priv_mem_dev_addr(shader->rsd);
++   const uint64_t rsd = panvk_priv_mem_dev_addr(shader->rsd);
++   p_atomic_set(&dev->desc_copy_rsd, rsd);
++   return rsd;
+ }
+ 
+ VkResult
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index cf7cd91a9f5..4fed9c11f45 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -798,6 +798,17 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
+    cmdbuf->cur_batch->vary_infos = UTIL_DYNARRAY_INIT;
+ #if PAN_ARCH < 9
+    cmdbuf->cur_batch->minmax_draws = UTIL_DYNARRAY_INIT;
++#endif
++   /* Reserve room up front: emulators open ~100 small batches per frame,
++    * and growing each array from empty meant several reallocs per batch
++    * (2-3% of ARMSX2's GS thread in NFS Most Wanted). A failed reserve is
++    * harmless, the appends grow the arrays as before. */
++   util_dynarray_ensure_cap(&cmdbuf->cur_batch->jobs, 64 * sizeof(void *));
++   util_dynarray_ensure_cap(&cmdbuf->cur_batch->vary_infos,
++                            16 * sizeof(uint32_t *));
++#if PAN_ARCH < 9
++   util_dynarray_ensure_cap(&cmdbuf->cur_batch->minmax_draws,
++                            16 * sizeof(struct libpan_minmax_draw));
+ #endif
+    /* jm-v7 106: with per-half indirect varying buffers, every batch takes
+     * its own allocator, in the buffer of its heap half. */
+diff --git a/src/panfrost/vulkan/panvk_device.h b/src/panfrost/vulkan/panvk_device.h
+index 173b23f64e7..985bd9544f0 100644
+--- a/src/panfrost/vulkan/panvk_device.h
++++ b/src/panfrost/vulkan/panvk_device.h
+@@ -106,6 +106,12 @@ struct panvk_device {
+ 
+    struct vk_meta_device meta;
+ 
++   /* RENDERER_STATE of the descriptor-copy shader (Bifrost), cached after
++    * its first lookup: it is looked up for nearly every draw, and the
++    * vk_meta hash lookup showed up in draw-heavy games (ARMSX2). The shader
++    * lives in dev->meta for the device's lifetime. */
++   uint64_t desc_copy_rsd;
++
+    /* BC emulation (csf-v11/200): PANVK_DEBUG=bc_timing GPU timestamps,
+     * under the lock in panvk_vX_cmd_meta.c. */
+    struct {
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c b/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
+index 5e1348e9742..049a8750eca 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
+@@ -75,11 +75,23 @@ prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
+    const struct pan_fau_layout *fau = &shader->info.fau;
+    uint32_t w;
+ 
++   /* Build each block in a cached stack buffer and copy it to the
++    * (CPU-uncached) descriptor memory once: the immediate and relocation
++    * passes below merge 32-bit halves, and reading those back from device
++    * memory made this function the top driver cost per draw in draw-heavy
++    * games (ARMSX2). total_count is at most 64 words. */
++   uint64_t stage[64];
++   const bool staged = shader->fau.total_count <= ARRAY_SIZE(stage);
++
+    for (uint32_t r = 0; r < repeat_count; r++) {
+       /* Each repeat owns its own contiguous block of total_count slots. */
+-      uint64_t *repeat_faus = faus + r * shader->fau.total_count;
++      uint64_t *dst_faus = faus + r * shader->fau.total_count;
++      uint64_t *repeat_faus = staged ? stage : dst_faus;
+       uint32_t fau_idx = 0;
+ 
++      if (staged)
++         memset(stage, 0, shader->fau.total_count * sizeof(uint64_t));
++
+       common_inner.push_uniforms =
+          push_uniforms->gpu + r * shader->fau.total_count * sizeof(uint64_t);
+ 
+@@ -122,6 +134,9 @@ prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
+             ((uint64_t)v << (32 * hi));
+       }
+ #endif
++
++      if (staged)
++         memcpy(dst_faus, stage, shader->fau.total_count * sizeof(uint64_t));
+    }
+ 
+    return VK_SUCCESS;
+-- 
+2.43.0
+

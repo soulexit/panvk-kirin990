@@ -1,5 +1,18 @@
 # Changelog
 
+## soulexit PanVK 1.0.002 (release page) — 2026-11-13
+
+Released on [soulexit/panvk-bifrost-soulexit](https://github.com/soulexit/panvk-bifrost-soulexit)
+only; 1.0.001 plus patches 0073-0074 (tree `574f4b3`).
+
+- **ARMSX2 closed when the screen rotated** (0073, #8, #11). Android 16's Vulkan loader does not
+  implement `vkReleaseSwapchainImagesKHR`, but the driver advertised `swapchain_maintenance1`, so
+  ARMSX2 called a null pointer when it recreated the swapchain. The extension is no longer
+  advertised on Android.
+- **Less CPU per draw** (0074): the descriptor-copy RSD is cached on the device, per-batch job
+  arrays are pre-sized, and push-uniform blocks are built in cached memory and copied once. In
+  ARMSX2 (NFS Most Wanted, Mali-G72) the driver's share of the GS thread goes from 44.1% to 42.5%.
+
 ## soulexit PanVK 1.0.001 (release page) — 2026-11-13
 
 Released on [soulexit/panvk-bifrost-soulexit](https://github.com/soulexit/panvk-bifrost-soulexit)
