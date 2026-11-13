@@ -1,0 +1,251 @@
+From 4d5be2c3c66132909b046224474bb8988e50221f Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 13 Nov 2026 20:02:42 +0300
+Subject: [PATCH 75/76] panvk/jm: no CPU wait for semaphore atoms on submit,
+ cheaper job diagnostics
+
+- A semaphore holds the last atom of up to three batches. A submit that
+  waited on it sent the first to the GPU as a pre-dependency and waited
+  for the others on the CPU, so ARMSX2 blocked on its previous submit on
+  nearly every vkQueueSubmit. Atoms of a queue form one chain, so the
+  newest of them (by a per-queue submission counter) now goes to the GPU
+  alone; atoms this queue did not submit are still waited on the CPU.
+  PANVK_JM_SEM_NEWEST=0 restores the old behaviour.
+- The description of each submitted job for panvk_errors.txt is kept as
+  numbers and formatted only when a job fails: two snprintf()s per atom
+  were 2% of ARMSX2's GS thread.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/jm/panvk_queue.h        |   4 +
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c | 147 +++++++++++++++-----
+ 2 files changed, 114 insertions(+), 37 deletions(-)
+
+diff --git a/src/panfrost/vulkan/jm/panvk_queue.h b/src/panfrost/vulkan/jm/panvk_queue.h
+index f52a7569773..291e1f2d2d2 100644
+--- a/src/panfrost/vulkan/jm/panvk_queue.h
++++ b/src/panfrost/vulkan/jm/panvk_queue.h
+@@ -40,6 +40,10 @@ struct panvk_gpu_queue {
+    /* v67b: last fragment atom per tiler heap half, last vtc atom */
+    uint64_t half_frag_atom[2];
+    uint64_t last_vtc_atom;
++   /* Submission order of the atoms this queue submitted, by atom number
++    * (0 = not ours). Picks the newest semaphore atom in gpu_queue_submit(). */
++   uint64_t atom_seq[256];
++   uint64_t next_seq;
+ #if PAN_ARCH == 9
+    /* Atom numbers submitted by the current vkQueueSubmit (see dep_type()). */
+    BITSET_DECLARE(submit_atoms, 256);
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 08ae00b90e0..ce851c020a7 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -91,6 +91,8 @@ dep_type(const struct panvk_gpu_queue *queue, uint64_t atom)
+ static void
+ note_submitted(struct panvk_gpu_queue *queue, uint64_t atom)
+ {
++   if (atom && atom < ARRAY_SIZE(queue->atom_seq))
++      queue->atom_seq[atom] = ++queue->next_seq;
+ #if PAN_ARCH == 9
+    if (atom && atom < 256)
+       BITSET_SET(queue->submit_atoms, atom);
+@@ -153,9 +155,67 @@ panvk_reset_issued_batch(struct panvk_cmd_buffer *cmdbuf,
+ }
+ 
+ 
+-/* Diagnostics: one line per kbase atom number describing the batch it ran,
+- * printed by kbase when that atom fails (kbase_kmod_atom_fail_cb). */
+-static char panvk_diag_atoms[256][128];
++/* Diagnostics: what the batch of each kbase atom number ran, printed when
++ * that atom fails (kbase_kmod_atom_fail_cb). Kept as numbers and formatted
++ * only on failure: two snprintf()s per atom cost 2% of ARMSX2's GS thread.
++ */
++struct panvk_diag_rec {
++   const char *kind;
++   unsigned fb_w, fb_h, draws, gs, tess, xfb, dispatches, cs_hash;
++   unsigned wg[3], local[3], vtc_jobs, frag_jobs, tls, wls;
++   unsigned long long max_verts;
++   bool indirect;
++};
++static struct panvk_diag_rec panvk_diag_atoms[256];
++
++static void
++panvk_diag_rec_fill(struct panvk_diag_rec *r, const char *kind,
++                    const struct panvk_batch *batch)
++{
++   *r = (struct panvk_diag_rec){
++      .kind = kind,
++      .fb_w = batch->diag.fb_w, .fb_h = batch->diag.fb_h,
++      .draws = batch->diag.draws, .gs = batch->diag.gs,
++      .tess = batch->diag.tess, .xfb = batch->diag.xfb,
++      .dispatches = batch->diag.dispatches, .cs_hash = batch->diag.cs_hash,
++      .wg = {batch->diag.wg[0], batch->diag.wg[1], batch->diag.wg[2]},
++      .local = {batch->diag.local[0], batch->diag.local[1],
++                batch->diag.local[2]},
++      .vtc_jobs = batch->vtc_jc.job_index,
++      .frag_jobs = batch->frag_jc.job_index,
++      .tls = batch->tlsinfo.tls.size,
++      .wls = (unsigned)batch->wls_total_size,
++      .max_verts = (unsigned long long)batch->diag.max_verts,
++      .indirect = batch->diag.indirect,
++   };
++}
++
++/* The failure line (long) or the history line (short). */
++static const char *
++panvk_diag_rec_str(const struct panvk_diag_rec *r, bool hist, char *buf,
++                   size_t size)
++{
++   if (!r->kind)
++      return "(unknown)";
++   if (hist)
++      snprintf(buf, size,
++               "%s fb=%ux%u draws=%u gs=%u tess=%u disp=%u cs=%08x wg=%ux%ux%u "
++               "l=%ux%u tls=%u wls=%u vtc=%u frag=%u",
++               r->kind, r->fb_w, r->fb_h, r->draws, r->gs, r->tess,
++               r->dispatches, r->cs_hash, r->wg[0], r->wg[1], r->wg[2],
++               r->local[0], r->local[1], r->tls, r->wls, r->vtc_jobs,
++               r->frag_jobs);
++   else
++      snprintf(buf, size,
++               "%s fb=%ux%u draws=%u gs=%u tess=%u xfb=%u max_verts=%llu "
++               "vtc_jobs=%u frag_jobs=%u disp=%u cs=%08x wg=%ux%ux%u "
++               "local=%ux%ux%u%s",
++               r->kind, r->fb_w, r->fb_h, r->draws, r->gs, r->tess, r->xfb,
++               r->max_verts, r->vtc_jobs, r->frag_jobs, r->dispatches,
++               r->cs_hash, r->wg[0], r->wg[1], r->wg[2], r->local[0],
++               r->local[1], r->local[2], r->indirect ? " indirect" : "");
++   return buf;
++}
+ 
+ /* Diagnostics: history of the last 128 submitted atoms (submit and
+  * completion time, what they ran), dumped once on the first failed atom, so
+@@ -164,7 +224,7 @@ static char panvk_diag_atoms[256][128];
+ struct panvk_diag_hist {
+    uint64_t submit_ns, done_ns;
+    unsigned atom;
+-   char desc[160];
++   struct panvk_diag_rec rec;
+ };
+ static struct panvk_diag_hist panvk_diag_hist[128];
+ static unsigned panvk_diag_hist_n;
+@@ -190,9 +250,9 @@ extern void panvk_errlog(const char *fmt, ...) PRINTFLIKE(1, 2);
+ static void
+ panvk_diag_atom_failed(unsigned atom)
+ {
+-   const char *what = panvk_diag_atoms[atom & 255][0]
+-                         ? panvk_diag_atoms[atom & 255]
+-                         : "(unknown)";
++   char what_buf[192];
++   const char *what = panvk_diag_rec_str(&panvk_diag_atoms[atom & 255], false,
++                                         what_buf, sizeof(what_buf));
+    mesa_loge("panvk: failed atom %u ran: %s", atom, what);
+    /* panvk_errors.txt: the first 32 failures of the process (a lost
+     * context fails every queued job after the first one). */
+@@ -210,18 +270,21 @@ panvk_diag_atom_failed(unsigned atom)
+       for (unsigned i = n; i-- > 0;) {
+          const struct panvk_diag_hist *h =
+             &panvk_diag_hist[(panvk_diag_hist_n - 1 - i) & 127];
++         char desc_buf[192];
++         const char *desc =
++            panvk_diag_rec_str(&h->rec, true, desc_buf, sizeof(desc_buf));
+          if (h->done_ns) {
+             mesa_loge("HIST atom %3u sub -%.1f done -%.1f (%.1f ms) %s", h->atom,
+                       (now - h->submit_ns) / 1e6, (now - h->done_ns) / 1e6,
+-                      (h->done_ns - h->submit_ns) / 1e6, h->desc);
++                      (h->done_ns - h->submit_ns) / 1e6, desc);
+             panvk_errlog("  atom %3u sub -%.1f done -%.1f (%.1f ms) %s", h->atom,
+                          (now - h->submit_ns) / 1e6, (now - h->done_ns) / 1e6,
+-                         (h->done_ns - h->submit_ns) / 1e6, h->desc);
++                         (h->done_ns - h->submit_ns) / 1e6, desc);
+          } else {
+             mesa_loge("HIST atom %3u sub -%.1f NOT DONE %s", h->atom,
+-                      (now - h->submit_ns) / 1e6, h->desc);
++                      (now - h->submit_ns) / 1e6, desc);
+             panvk_errlog("  atom %3u sub -%.1f NOT DONE %s", h->atom,
+-                         (now - h->submit_ns) / 1e6, h->desc);
++                         (now - h->submit_ns) / 1e6, desc);
+          }
+       }
+    }
+@@ -536,29 +599,10 @@ panvk_diag_note_atom(uint64_t atom, const char *kind,
+       h->submit_ns = os_time_get_nano();
+       h->done_ns = 0;
+       h->atom = atom & 255;
+-      snprintf(h->desc, sizeof(h->desc),
+-               "%s fb=%ux%u draws=%u gs=%u tess=%u disp=%u cs=%08x wg=%ux%ux%u "
+-               "l=%ux%u tls=%u wls=%u vtc=%u frag=%u",
+-               kind, batch->diag.fb_w, batch->diag.fb_h, batch->diag.draws,
+-               batch->diag.gs, batch->diag.tess, batch->diag.dispatches,
+-               batch->diag.cs_hash, batch->diag.wg[0], batch->diag.wg[1],
+-               batch->diag.wg[2], batch->diag.local[0], batch->diag.local[1],
+-               batch->tlsinfo.tls.size, (unsigned)batch->wls_total_size,
+-               batch->vtc_jc.job_index, batch->frag_jc.job_index);
++      panvk_diag_rec_fill(&h->rec, kind, batch);
+       simple_mtx_unlock(&panvk_diag_hist_lock);
+    }
+-   snprintf(panvk_diag_atoms[atom & 255], sizeof(panvk_diag_atoms[0]),
+-            "%s fb=%ux%u draws=%u gs=%u tess=%u xfb=%u max_verts=%llu "
+-            "vtc_jobs=%u frag_jobs=%u disp=%u cs=%08x wg=%ux%ux%u "
+-            "local=%ux%ux%u%s",
+-            kind, batch->diag.fb_w, batch->diag.fb_h, batch->diag.draws,
+-            batch->diag.gs, batch->diag.tess, batch->diag.xfb,
+-            (unsigned long long)batch->diag.max_verts,
+-            batch->vtc_jc.job_index, batch->frag_jc.job_index,
+-            batch->diag.dispatches, batch->diag.cs_hash, batch->diag.wg[0],
+-            batch->diag.wg[1], batch->diag.wg[2], batch->diag.local[0],
+-            batch->diag.local[1], batch->diag.local[2],
+-            batch->diag.indirect ? " indirect" : "");
++   panvk_diag_rec_fill(&panvk_diag_atoms[atom & 255], kind, batch);
+ }
+ 
+ static uint64_t
+@@ -930,11 +974,40 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+                                submit->waits[w].wait_value,
+                                VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+       }
+-      /* One atom goes to the GPU as a pre-dependency, extra ones are
+-       * waited on the CPU (rare). */
+-      for (unsigned a = 1; a < n_in; a++)
+-         kbase_kmod_wait_atom(dev->kmod.dev, in_atoms[a], -1);
+-      queue->in_dep = n_in ? in_atoms[0] : 0;
++      /* One atom goes to the GPU as a pre-dependency. A semaphore holds the
++       * last atom of up to PANVK_KBASE_SYNC_TARGET_COUNT batches, so this
++       * is the common case, not a rare one: ARMSX2 waited here on the CPU
++       * for its previous submit on nearly every vkQueueSubmit, and the GPU
++       * idled while it recorded the next one. Atoms of this queue form one
++       * chain (every vertex/tiler atom depends on the queue's last atom or
++       * on its last vertex/tiler atom, every fragment atom on its
++       * vertex/tiler atom and on the last fragment atom), so the newest of
++       * them completes after all older ones: depend on that one alone.
++       * Atoms this queue did not submit are still waited on the CPU.
++       * PANVK_JM_SEM_NEWEST=0: old behaviour (A/B). */
++      static int newest_only = -1;
++      if (newest_only < 0) {
++         const char *e = getenv("PANVK_JM_SEM_NEWEST");
++         newest_only = !(e && e[0] == '0');
++      }
++      bool all_ours = newest_only && n_in > 1;
++      unsigned newest = 0;
++      for (unsigned a = 0; all_ours && a < n_in; a++) {
++         const uint64_t seq = in_atoms[a] < ARRAY_SIZE(queue->atom_seq)
++                                 ? queue->atom_seq[in_atoms[a]]
++                                 : 0;
++         if (!seq)
++            all_ours = false;
++         else if (seq > queue->atom_seq[in_atoms[newest]])
++            newest = a;
++      }
++      if (all_ours) {
++         queue->in_dep = in_atoms[newest];
++      } else {
++         for (unsigned a = 1; a < n_in; a++)
++            kbase_kmod_wait_atom(dev->kmod.dev, in_atoms[a], -1);
++         queue->in_dep = n_in ? in_atoms[0] : 0;
++      }
+ 
+       (void)0;
+ 
+-- 
+2.43.0
+

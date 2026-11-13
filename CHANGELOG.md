@@ -1,5 +1,25 @@
 # Changelog
 
+## soulexit PanVK 1.0.003 (release page) — 2026-11-13
+
+Released on [soulexit/panvk-bifrost-soulexit](https://github.com/soulexit/panvk-bifrost-soulexit)
+only; 1.0.002 plus patches 0075-0076 (tree `6bab783`).
+
+- **Present without a CPU wait on Android** (0076). JM has no CQS, so the release fence of
+  `vkQueueSignalReleaseImageANDROID` was made by waiting for the frame on the CPU: ARMSX2's render
+  thread slept there 44% of the time and the GPU idled while the next frame was recorded. A
+  `BASE_JD_REQ_SOFT_FENCE_TRIGGER` soft job that depends on the frame's newest atoms now gives a
+  sync_file that kbase signals. Only for the platform's present: Winlator's Vulkan wrapper attaches
+  exported fences to the image dma-buf, and NFS Most Wanted crashed there with real fences, so other
+  exports keep the CPU wait. `PANVK_JM_EXPORT_FENCE=0` turns it off.
+  NFS Most Wanted in ARMSX2: Galaxy A51 (G72) 9 -> 14 fps, Vivo V21s (G52) 9 -> 12 fps.
+- **Imported sync_files were never closed** (0076) except by a second import or vkDestroy*: the
+  WSI acquire fence leaked once those were real (16 fds a second in ARMSX2).
+- **No CPU wait for semaphore atoms on submit** (0075): the newest atom of a semaphore goes to the
+  GPU alone (atoms of a queue form one chain); before, the others were waited on the CPU, which
+  ARMSX2 hit on nearly every submit. `PANVK_JM_SEM_NEWEST=0` restores it.
+- Job descriptions for `panvk_errors.txt` are formatted only when a job fails (0075).
+
 ## soulexit PanVK 1.0.002 (release page) — 2026-11-13
 
 Released on [soulexit/panvk-bifrost-soulexit](https://github.com/soulexit/panvk-bifrost-soulexit)

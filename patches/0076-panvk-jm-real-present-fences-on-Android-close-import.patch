@@ -1,0 +1,353 @@
+From 6bab78351fd55931f57fca8b8ddbc68c3668dd9a Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Fri, 13 Nov 2026 20:02:42 +0300
+Subject: [PATCH 76/76] panvk/jm: real present fences on Android, close
+ imported sync_files
+
+- JM has no CQS, so the release fence of vkQueueSignalReleaseImageANDROID
+  was made by waiting for the frame on the CPU: ARMSX2's render thread
+  slept there 44% of the time and the GPU idled while the next frame was
+  recorded. A BASE_JD_REQ_SOFT_FENCE_TRIGGER soft job that depends on the
+  frame's newest atoms now gives a sync_file that kbase signals
+  (kbase_kmod_jm_export_fence()); finished work still exports -1. Only
+  for the platform present: Winlator's Vulkan wrapper puts exported
+  fences on the image dma-buf and NFS Most Wanted crashed with real ones,
+  so other exports keep the CPU wait. If the kernel refuses the soft job
+  this is logged once and the CPU wait is used. PANVK_JM_EXPORT_FENCE=0
+  turns it off.
+- An imported sync_file (the WSI acquire fence) was only closed by a
+  second import or vkDestroy*: signal, reset, a successful wait, re-arm
+  and move dropped it. With real present fences the compositor's acquire
+  fences are real too, and ARMSX2 leaked 16 fds a second.
+
+NFS Most Wanted (ARMSX2): Galaxy A51 (Mali-G72) 9 -> 14 fps, Vivo V21s
+(Mali-G52) 9 -> 12 fps. CTS on the A51 matches 1.0.002.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/lib/kmod/kbase_kmod.c          | 122 ++++++++++++++++++++
+ src/panfrost/lib/kmod/kbase_kmod.h          |   8 ++
+ src/panfrost/vulkan/panvk_android.c         |  18 +++
+ src/panfrost/vulkan/panvk_physical_device.c |  54 +++++++++
+ src/panfrost/vulkan/panvk_physical_device.h |   4 +
+ 5 files changed, 206 insertions(+)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 9dadd51c768..843418cfbe2 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -3753,6 +3753,128 @@ kbase_kmod_job_submit_dep(struct pan_kmod_dev *dev, uint64_t jc,
+    return atom.atom_number;
+ }
+ 
++bool
++kbase_kmod_atom_is_done(struct pan_kmod_dev *dev, uint64_t atom_num)
++{
++   struct kbase_kmod_dev *kd = container_of(dev, struct kbase_kmod_dev, base);
++   if (kd->is_csf || atom_num >= KBASE_MAX_ATOMS)
++      return false;
++   if (!atom_num)
++      return true;
++   if (kbase_drain_events(kd, 0) < 0)
++      return false;
++
++   bool done = false, present = false;
++   simple_mtx_lock(&kd->atoms_lock);
++   for (unsigned i = 0; i < KBASE_MAX_ATOMS; i++) {
++      if (kd->atoms[i].atom_number == atom_num) {
++         present = true;
++         done = kd->atoms[i].completed;
++         break;
++      }
++   }
++   if (!present)
++      done = kd->last_done_atom_ctx[atom_num] == atom_num;
++   simple_mtx_unlock(&kd->atoms_lock);
++   return done;
++}
++
++#define KBASE_JD_REQ_SOFT_FENCE_TRIGGER 0x202 /* BASE_JD_REQ_SOFT_JOB | 2 */
++struct kbase_ioctl_stream_create_jm {
++   char name[32];
++};
++#define KBASE_IOCTL_STREAM_CREATE_JM \
++   _IOW(KBASE_IOCTL_TYPE, 18, struct kbase_ioctl_stream_create_jm)
++
++/* jm-v7 120: present without a CPU wait. JM has no CQS, so the WSI's
++ * release fence used to be exported by waiting for the frame on the CPU:
++ * the game's render thread slept there for 44% of the time in ARMSX2 and
++ * the GPU idled while it recorded the next frame. A fence-trigger soft job
++ * that depends on the frame's last atoms gives a real sync_file instead;
++ * the compositor waits on it. Kernels with sync_file ignore the stream fd,
++ * legacy Android sync needs one (KBASE_IOCTL_STREAM_CREATE).
++ */
++int
++kbase_kmod_jm_export_fence(struct pan_kmod_dev *dev, uint64_t dep0,
++                           uint64_t dep1)
++{
++   struct kbase_kmod_dev *kd = container_of(dev, struct kbase_kmod_dev, base);
++   static int disabled;
++   static int stream_fd = -2;
++
++   if (kd->is_csf || p_atomic_read(&disabled)) {
++      errno = ENOTSUP;
++      return -1;
++   }
++   if (dep0 >= KBASE_MAX_ATOMS || dep1 >= KBASE_MAX_ATOMS) {
++      errno = EINVAL;
++      return -1;
++   }
++
++   if (p_atomic_read(&stream_fd) == -2) {
++      struct kbase_ioctl_stream_create_jm sc = { .name = "panvk" };
++      int fd = ioctl(dev->fd, KBASE_IOCTL_STREAM_CREATE_JM, &sc);
++      if (fd < 0)
++         fd = -1;
++      if (p_atomic_cmpxchg(&stream_fd, -2, fd) != -2 && fd >= 0)
++         close(fd);
++   }
++
++   struct kbase_atom_slot *slot =
++      kbase_atom_alloc(kd, NULL, 0, KBASE_JD_REQ_SOFT_FENCE_TRIGGER, true);
++   if (!slot)
++      return -1;
++
++   struct base_fence fence = {
++      .basep = { .fd = -1, .stream_fd = p_atomic_read(&stream_fd) },
++   };
++   struct base_jd_atom atom = {
++      .jc = (uintptr_t)&fence,
++      .core_req = KBASE_JD_REQ_SOFT_FENCE_TRIGGER,
++      .atom_number = (uint8_t)slot->atom_number,
++   };
++   const uint64_t deps[2] = { dep0, dep1 != dep0 ? dep1 : 0 };
++   for (unsigned i = 0; i < 2; i++) {
++      if (deps[i] && deps[i] != atom.atom_number) {
++         atom.pre_dep[i].atom_id = (uint8_t)deps[i];
++         atom.pre_dep[i].dependency_type = BASE_JD_DEP_TYPE_ORDER;
++      }
++   }
++
++   struct {
++      __u64 seq_nr;
++      struct base_jd_atom atom;
++   } w = { .atom = atom };
++   struct kbase_ioctl_job_submit sub = {
++      .addr = kd->atom_seq_nr ? (uintptr_t)&w : (uintptr_t)&atom,
++      .nr_atoms = 1,
++      .stride = kd->atom_stride,
++   };
++   if (ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &sub) < 0) {
++      const int err = errno;
++      simple_mtx_lock(&kd->atoms_lock);
++      slot->atom_number = 0;
++      simple_mtx_unlock(&kd->atoms_lock);
++      p_atomic_set(&disabled, 1);
++      mesa_logi("kbase: JM fence export unavailable (submit: %s), presents "
++                "wait on the CPU", strerror(err));
++      errno = err;
++      return -1;
++   }
++
++   /* kbase writes the fd back into the base_fence while preparing the soft
++    * job. Without it the atom fails on its own (one error event). */
++   const int fd = fence.basep.fd;
++   if (fd < 0) {
++      p_atomic_set(&disabled, 1);
++      mesa_logi("kbase: JM fence export unavailable (no fence fd), presents "
++                "wait on the CPU");
++      errno = ENOTSUP;
++      return -1;
++   }
++   return fd;
++}
++
+ void
+ kbase_kmod_atom_release(struct pan_kmod_dev *dev, uint64_t atom_num)
+ {
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.h b/src/panfrost/lib/kmod/kbase_kmod.h
+index 0d192e71ee1..df1c5d07704 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.h
++++ b/src/panfrost/lib/kmod/kbase_kmod.h
+@@ -49,6 +49,14 @@ bool kbase_kmod_job_submit_retry(struct pan_kmod_dev *dev, uint64_t jc,
+                                 uint32_t nbo,
+                                 struct base_external_resource *ext_res,
+                                 uint32_t next_res, int max_attempts);
++/* JM: a sync_file fd that kbase signals once atoms dep0 and dep1 (0 = none)
++ * have completed, from a BASE_JD_REQ_SOFT_FENCE_TRIGGER soft job. -1 with
++ * errno set when the kernel cannot do it (then it is not tried again). */
++/* JM: true when the atom has completed (after reading pending events),
++ * without consuming it the way kbase_kmod_wait_atom() does. */
++bool kbase_kmod_atom_is_done(struct pan_kmod_dev *dev, uint64_t atom_number);
++int kbase_kmod_jm_export_fence(struct pan_kmod_dev *dev, uint64_t dep0,
++                               uint64_t dep1);
+ bool kbase_kmod_wait_atom(struct pan_kmod_dev *dev, uint64_t atom_number,
+                          int64_t timeout_ns);
+ /* Bytes of physical memory the kernel has committed to a BO (a
+diff --git a/src/panfrost/vulkan/panvk_android.c b/src/panfrost/vulkan/panvk_android.c
+index 91fe72d5a33..869ce5b87bd 100644
+--- a/src/panfrost/vulkan/panvk_android.c
++++ b/src/panfrost/vulkan/panvk_android.c
+@@ -16,6 +16,8 @@
+ 
+ #include "vk_alloc.h"
+ #include "vk_android.h"
++#include "vk_common_entrypoints.h"
++#include "panvk_entrypoints.h"
+ #include "vk_device_memory.h"
+ #include "vk_util.h"
+ 
+@@ -455,3 +457,19 @@ panvk_GetAndroidHardwareBufferPropertiesANDROID(
+    pProperties->allocationSize = real_size;
+    return VK_SUCCESS;
+ }
++
++/* jm-v7 120: present fences. The runtime's implementation submits the wait
++ * semaphores and exports a sync_file; on JM the export hands out a kbase
++ * fence only while this flag is set (see kbase_cpu_sync_export_sync_file_jm),
++ * so the render thread no longer waits for each frame. */
++VKAPI_ATTR VkResult VKAPI_CALL
++panvk_QueueSignalReleaseImageANDROID(VkQueue queue, uint32_t waitSemaphoreCount,
++                                     const VkSemaphore *pWaitSemaphores,
++                                     VkImage image, int *pNativeFenceFd)
++{
++   panvk_kbase_export_real_fence = true;
++   VkResult result = vk_common_QueueSignalReleaseImageANDROID(
++      queue, waitSemaphoreCount, pWaitSemaphores, image, pNativeFenceFd);
++   panvk_kbase_export_real_fence = false;
++   return result;
++}
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index ac2bd943942..d69cf7a0774 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -739,6 +739,9 @@ kbase_cpu_sync_signal(UNUSED struct vk_device *device, struct vk_sync *sync,
+    struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
+    kbase_kmod_diag_sample_imports("sync_signal");
+    mtx_lock(&ks->mutex);
++   /* A waiter polls the fd unlocked while WAITING: leave it then. */
++   if (ks->state != KBASE_CPU_SYNC_WAITING)
++      kbase_sync_file_waiter_free(ks);
+    ks->state = KBASE_CPU_SYNC_SIGNALED;
+    ks->result = VK_SUCCESS;
+    ks->pending_data = NULL;
+@@ -754,6 +757,7 @@ kbase_cpu_sync_reset(UNUSED struct vk_device *device, struct vk_sync *sync)
+    struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
+    mtx_lock(&ks->mutex);
+    assert(ks->state != KBASE_CPU_SYNC_WAITING);
++   kbase_sync_file_waiter_free(ks);
+    ks->state = KBASE_CPU_SYNC_RESET;
+    ks->result = VK_SUCCESS;
+    ks->pending_data = NULL;
+@@ -785,6 +789,8 @@ panvk_kbase_sync_set_pending(
+     * (e.g. a reused WSI semaphore that was CPU-waited) is legal.  Only an
+     * in-progress wait on the old payload would be a genuine bug. */
+    assert(ks->state != KBASE_CPU_SYNC_WAITING);
++   if (ks->pending_data != data && ks->state != KBASE_CPU_SYNC_WAITING)
++      kbase_sync_file_waiter_free(ks);
+    ks->pending_data = data;
+    ks->pending_wait = wait;
+    memcpy(ks->targets, targets, sizeof(ks->targets));
+@@ -896,6 +902,7 @@ kbase_cpu_sync_wait_one(struct vk_device *device, struct kbase_cpu_sync *ks,
+          mtx_lock(&ks->mutex);
+          if (result == VK_SUCCESS) {
+             ks->state = KBASE_CPU_SYNC_SIGNALED;
++            kbase_sync_file_waiter_free(ks);
+             ks->pending_data = NULL;
+             ks->pending_wait = NULL;
+          } else if (result == VK_TIMEOUT) {
+@@ -1117,6 +1124,7 @@ kbase_cpu_sync_move(UNUSED struct vk_device *device, struct vk_sync *dst,
+    assert(ks_src->state != KBASE_CPU_SYNC_WAITING);
+    assert(ks_dst->state != KBASE_CPU_SYNC_WAITING);
+ 
++   kbase_sync_file_waiter_free(ks_dst);
+    ks_dst->state = ks_src->state;
+    ks_dst->result = ks_src->result;
+    ks_dst->pending_data = ks_src->pending_data;
+@@ -1180,6 +1188,10 @@ kbase_sync_file_wait_func(void *data, UNUSED const uint64_t *targets,
+    }
+ }
+ 
++/* Closes an imported sync_file. Every place that drops or replaces a
++ * payload calls this (jm-v7 120): before, only a second import and
++ * vkDestroy* closed it, and the dup() of each WSI acquire fence leaked once
++ * presents exported real fences (ARMSX2: 16 fds a second). */
+ static void
+ kbase_sync_file_waiter_free(struct kbase_cpu_sync *ks)
+ {
+@@ -1291,6 +1303,7 @@ out:
+    return VK_SUCCESS;
+ }
+ 
++__thread bool panvk_kbase_export_real_fence;
+ uint64_t panvk_kbase_export_wait_ns;
+ uint32_t panvk_kbase_export_count;
+ 
+@@ -1315,8 +1328,49 @@ kbase_cpu_sync_export_sync_file_jm(struct vk_device *device,
+       *sync_file = fd;
+       return VK_SUCCESS;
+    }
++   /* jm-v7 120: a submitted payload of GPU atoms becomes a kbase fence
++    * (kbase_kmod_jm_export_fence()), so present does not wait for the
++    * frame. Atoms of the queue complete in chain order, so the newest two
++    * targets cover the rest. Only for the Android platform's present
++    * (panvk_QueueSignalReleaseImageANDROID()): Winlator's Vulkan wrapper
++    * puts exported fences on the image's dma-buf, and with real fences
++    * there NFS Most Wanted crashed within seconds; other exports keep the
++    * CPU wait. PANVK_JM_EXPORT_FENCE=0: CPU wait everywhere (old). */
++   static int use_fence = -1;
++   if (use_fence < 0) {
++      const char *e = getenv("PANVK_JM_EXPORT_FENCE");
++      use_fence = !(e && e[0] == '0');
++   }
++   uint64_t newest[2] = {0, 0};
++   bool fence_ok = use_fence && panvk_kbase_export_real_fence &&
++                   (ks->state == KBASE_CPU_SYNC_PENDING ||
++                                 ks->state == KBASE_CPU_SYNC_WAITING);
++   for (unsigned i = 0; fence_ok && i < PANVK_KBASE_SYNC_TARGET_COUNT; i++) {
++      if (ks->target_addrs[i])
++         fence_ok = false;
++      else if (ks->targets[i]) {
++         newest[1] = newest[0];
++         newest[0] = ks->targets[i];
++      }
++   }
++   fence_ok = fence_ok && newest[0];
+    mtx_unlock(&ks->mutex);
+ 
++   /* Already finished (the newest atom covers the others): -1 below. */
++   if (fence_ok && kbase_kmod_atom_is_done(to_panvk_device(device)->kmod.dev,
++                                           newest[0]))
++      fence_ok = false;
++
++   if (fence_ok) {
++      struct panvk_device *dev = to_panvk_device(device);
++      int fd = kbase_kmod_jm_export_fence(dev->kmod.dev, newest[0], newest[1]);
++      if (fd >= 0) {
++         p_atomic_inc(&panvk_kbase_export_count);
++         *sync_file = fd;
++         return VK_SUCCESS;
++      }
++   }
++
+    /* A/B only: hand out "signaled" without waiting for the GPU.  The
+     * consumer may then read the image before it is finished. */
+    static int nowait = -1;
+diff --git a/src/panfrost/vulkan/panvk_physical_device.h b/src/panfrost/vulkan/panvk_physical_device.h
+index 035913d7c0c..de169a33e4a 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.h
++++ b/src/panfrost/vulkan/panvk_physical_device.h
+@@ -133,6 +133,10 @@ void panvk_kbase_sync_set_pending(
+ bool panvk_kbase_sync_peek(struct vk_sync *sync, void **data,
+                            uint64_t targets[PANVK_KBASE_SYNC_TARGET_COUNT]);
+ 
++/* Set while vkQueueSignalReleaseImageANDROID() runs on this thread: only
++ * then does a JM sync_file export hand out a kbase fence (jm-v7 120). */
++extern __thread bool panvk_kbase_export_real_fence;
++
+ int panvk_kbase_sync_gpu_wait_targets(
+    struct vk_sync *sync, uint64_t out[PANVK_KBASE_SYNC_TARGET_COUNT]);
+ #endif
+-- 
+2.43.0
+
