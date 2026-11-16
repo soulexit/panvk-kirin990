@@ -1,0 +1,708 @@
+From cc8ea10237bd3933d8538100f5f1ad6988838cdd Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Sat, 14 Nov 2026 23:26:18 +0300
+Subject: [PATCH 79/84] panvk/jm: less CPU per submit and per draw (ARMSX2),
+ WIP
+
+Not CTS-tested yet (dev14).
+
+- One JOB_SUBMIT per vkQueueSubmit (jm-v7 125): the atoms are collected
+  per thread and sent together; anything that could wait for one, or
+  submits an atom right away, sends them first.
+  PANVK_JM_SUBMIT_BATCH=0: one ioctl per atom.
+- Non-blocking kbase fd (jm-v7 128): events are read until EAGAIN, without
+  a poll(0) before each read; zero-timeout drains do no poll at all.
+  PANVK_KBASE_NONBLOCK=0: old behaviour. Waits keep 1 ms poll steps (8 ms
+  steps were tried and lost ARMSX2 about 20% of its fps).
+- The job history reads the virtual counter instead of clock_gettime(),
+  which is a system call on the Galaxy A51's kernel (jm-v7 126).
+- Push uniform block reuse by content (jm-v7 127), off by default
+  (PANVK_PUSH_REUSE=1): too few hits in ARMSX2 to pay for the checks.
+- No relink of an unchanged vertex/geometry/fragment set (jm-v7 129).
+
+NFS Most Wanted (ARMSX2, Galaxy A51): 17-18 fps (a104d4a) -> 16-30 fps by
+area; the render thread's driver share 43% -> 39%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/lib/kmod/kbase_kmod.c            | 138 ++++++++++--
+ src/panfrost/lib/kmod/kbase_kmod.h            |   4 +
+ src/panfrost/vulkan/jm/panvk_cmd_buffer.h     |  12 ++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c    |  13 ++
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c   |  32 ++-
+ src/panfrost/vulkan/panvk_cmd_draw.h          |   3 +
+ src/panfrost/vulkan/panvk_priv_bo.h           |   2 +
+ .../vulkan/panvk_vX_cmd_push_constant.c       | 201 ++++++++++++------
+ 8 files changed, 316 insertions(+), 89 deletions(-)
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+index 843418cfbe2..93187ac7318 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -203,6 +203,10 @@ struct kbase_atom_slot {
+ struct kbase_kmod_dev {
+    struct pan_kmod_dev base;
+ 
++   /* jm-v7 128: the fd is O_NONBLOCK, so events are read until EAGAIN
++    * without a poll(0) before each read(). */
++   bool nonblock_events;
++
+    /* True for the CSF flavour of kbase (arch >= 10), false for JM. */
+    bool is_csf;
+ 
+@@ -2117,6 +2121,13 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
+       kbase_dev->atom_seq_nr = atom_seq_nr;
+       simple_mtx_init(&kbase_dev->atoms_lock, mtx_plain);
+       simple_mtx_init(&kbase_dev->atoms_read_lock, mtx_plain);
++      /* kbase_read() returns -EAGAIN on an empty queue with O_NONBLOCK.
++       * PANVK_KBASE_NONBLOCK=0: blocking fd, poll before every read. */
++      const char *nb = getenv("PANVK_KBASE_NONBLOCK");
++      const int fl = fcntl(fd, F_GETFL);
++      if (!(nb && nb[0] == '0') && fl >= 0 &&
++          fcntl(fd, F_SETFL, fl | O_NONBLOCK) == 0)
++         kbase_dev->nonblock_events = true;
+    }
+ 
+    if (is_csf && kbase_query_csif_info(fd, &kbase_dev->csif_info)) {
+@@ -3507,18 +3518,23 @@ kbase_atom_process_event_locked(struct kbase_kmod_dev *kd,
+ static int
+ kbase_drain_events(struct kbase_kmod_dev *kd, int timeout_ms)
+ {
+-   struct pollfd pfd = { .fd = kd->base.fd, .events = POLLIN };
+-   int ret = poll(&pfd, 1, timeout_ms);
+-   if (ret <= 0)
+-      return ret < 0 && errno != EINTR ? -1 : 0;
+-   if (!(pfd.revents & POLLIN))
+-      return -1;
++   /* jm-v7 128: with a non-blocking fd a zero timeout needs no poll(), and
++    * the loop below reads until EAGAIN instead of polling before each
++    * read: syscalls take the slow (traced) path on Android, and these were
++    * most of the event handling's cost in ARMSX2's render thread. */
++   if (!kd->nonblock_events || timeout_ms != 0) {
++      struct pollfd pfd = { .fd = kd->base.fd, .events = POLLIN };
++      int ret = poll(&pfd, 1, timeout_ms);
++      if (ret <= 0)
++         return ret < 0 && errno != EINTR ? -1 : 0;
++      if (!(pfd.revents & POLLIN))
++         return -1;
++   }
+ 
+    /* jm-v7 114: up to 16 events per read(). kbase_read() copies queued
+     * events while the buffer has room and returns as soon as the queue is
+     * empty once it has copied one, so a short read means the queue was
+-    * drained and no further poll() is needed. Before, every event cost a
+-    * poll() plus a read(). PANVK_KBASE_EVENT_BATCH=0 = one per read (old).
++    * drained. PANVK_KBASE_EVENT_BATCH=0 = one per read (old).
+     */
+    static int ev_batch = -1;
+    if (ev_batch < 0) {
+@@ -3526,18 +3542,21 @@ kbase_drain_events(struct kbase_kmod_dev *kd, int timeout_ms)
+       ev_batch = !(e && e[0] == '0');
+    }
+    const unsigned max_ev = ev_batch ? 16 : 1;
++   int ret = 0;
+ 
+    simple_mtx_lock(&kd->atoms_read_lock);
+    for (unsigned i = 0; i < KBASE_MAX_ATOMS; i++) {
+-      struct pollfd rfd = { .fd = kd->base.fd, .events = POLLIN };
+-      ret = poll(&rfd, 1, 0);
+-      if (ret <= 0) {
+-         ret = ret < 0 && errno != EINTR ? -1 : 0;
+-         break;
+-      }
+-      if (!(rfd.revents & POLLIN)) {
+-         ret = -1;
+-         break;
++      if (!kd->nonblock_events) {
++         struct pollfd rfd = { .fd = kd->base.fd, .events = POLLIN };
++         ret = poll(&rfd, 1, 0);
++         if (ret <= 0) {
++            ret = ret < 0 && errno != EINTR ? -1 : 0;
++            break;
++         }
++         if (!(rfd.revents & POLLIN)) {
++            ret = -1;
++            break;
++         }
+       }
+ 
+       struct base_jd_event_v2 ev[16];
+@@ -3545,6 +3564,10 @@ kbase_drain_events(struct kbase_kmod_dev *kd, int timeout_ms)
+       do {
+          n = read(kd->base.fd, ev, max_ev * sizeof(ev[0]));
+       } while (n < 0 && errno == EINTR);
++      if (n < 0 && kd->nonblock_events && errno == EAGAIN) {
++         ret = 0;
++         break;
++      }
+       if (n <= 0 || n % (ssize_t)sizeof(ev[0])) {
+          ret = -1;
+          break;
+@@ -3578,6 +3601,70 @@ kbase_reclaim_completed(struct kbase_kmod_dev *kd)
+    return n;
+ }
+ 
++/* jm-v7 125: the atoms of one vkQueueSubmit go to the kernel in one
++ * JOB_SUBMIT (it takes an array) instead of one ioctl each: 5.6% of
++ * ARMSX2's render thread was those ioctls (about 3800 a second). Per thread:
++ * between kbase_kmod_jm_defer_begin() and _end() the atoms are kept here.
++ * Anything that could wait for one of them, or submit an atom right away
++ * (a pre-dependency on a number the kernel has not seen yet counts as
++ * met), sends them first. PANVK_JM_SUBMIT_BATCH=0: one ioctl per atom. */
++#define KBASE_DEFER_MAX 64
++#define KBASE_DEFER_STRIDE_MAX 72
++static __thread struct {
++   struct kbase_kmod_dev *kd;
++   unsigned n;
++   struct kbase_atom_slot *slots[KBASE_DEFER_MAX];
++   uint8_t buf[KBASE_DEFER_MAX * KBASE_DEFER_STRIDE_MAX];
++} kbase_defer;
++
++static void
++kbase_defer_flush(void)
++{
++   struct kbase_kmod_dev *kd = kbase_defer.kd;
++   if (!kd || !kbase_defer.n)
++      return;
++   struct kbase_ioctl_job_submit sub = {
++      .addr = (uintptr_t)kbase_defer.buf,
++      .nr_atoms = kbase_defer.n,
++      .stride = kd->atom_stride,
++   };
++   if (ioctl(kd->base.fd, KBASE_IOCTL_JOB_SUBMIT, &sub) < 0) {
++      mesa_loge("kbase: JOB_SUBMIT of %u atoms failed: %s", kbase_defer.n,
++                strerror(errno));
++      simple_mtx_lock(&kd->atoms_lock);
++      for (unsigned i = 0; i < kbase_defer.n; i++)
++         kbase_defer.slots[i]->atom_number = 0;
++      simple_mtx_unlock(&kd->atoms_lock);
++   }
++   kbase_defer.n = 0;
++}
++
++void
++kbase_kmod_jm_defer_begin(struct pan_kmod_dev *dev)
++{
++   struct kbase_kmod_dev *kd = container_of(dev, struct kbase_kmod_dev, base);
++   static int on = -1;
++   if (on < 0) {
++      const char *e = getenv("PANVK_JM_SUBMIT_BATCH");
++      on = !(e && e[0] == '0');
++   }
++   if (!on || kd->is_csf || kd->atom_stride > KBASE_DEFER_STRIDE_MAX)
++      return;
++   kbase_defer_flush();
++   kbase_defer.kd = kd;
++   kbase_defer.n = 0;
++}
++
++void
++kbase_kmod_jm_defer_end(struct pan_kmod_dev *dev)
++{
++   struct kbase_kmod_dev *kd = container_of(dev, struct kbase_kmod_dev, base);
++   if (kbase_defer.kd != kd)
++      return;
++   kbase_defer_flush();
++   kbase_defer.kd = NULL;
++}
++
+ static struct kbase_atom_slot *
+ kbase_atom_alloc(struct kbase_kmod_dev *kd, struct pan_kmod_bo **bos,
+                  uint32_t nbo, uint32_t core_req, bool no_waiter)
+@@ -3587,6 +3674,8 @@ kbase_atom_alloc(struct kbase_kmod_dev *kd, struct pan_kmod_bo **bos,
+          kbase_atom_alloc_try(kd, bos, nbo, core_req, no_waiter);
+       if (s)
+          return s;
++      /* The table may be full of atoms this thread has not sent yet. */
++      kbase_defer_flush();
+       if (kbase_drain_events(kd, 0) < 0)
+          return NULL;
+       if (!kbase_reclaim_completed(kd) && kbase_drain_events(kd, 1) < 0)
+@@ -3607,6 +3696,7 @@ kbase_wait_atom(struct kbase_kmod_dev *kd, uint64_t atom_num,
+       errno = EINVAL;
+       return false;
+    }
++   kbase_defer_flush();
+ 
+    int64_t deadline = timeout_ns < 0 ? -1 :
+                       os_time_get_absolute_timeout(timeout_ns);
+@@ -3644,6 +3734,9 @@ kbase_wait_atom(struct kbase_kmod_dev *kd, uint64_t atom_num,
+       }
+       simple_mtx_unlock(&kd->atoms_lock);
+ 
++      /* 1 ms steps: another thread may read this atom's event between the
++       * check above and poll(), and only the timeout wakes this one then.
++       * 8 ms steps (jm-v7 126, tried) lost ARMSX2 about 20% of its fps. */
+       if (deadline >= 0 && os_time_get_nano() >= deadline)
+          return false;
+       if (kbase_drain_events(kd, 1) < 0)
+@@ -3667,6 +3760,7 @@ kbase_kmod_job_submit(struct pan_kmod_dev *dev, uint64_t jc,
+       return 0;
+    }
+ 
++   kbase_defer_flush();
+    struct kbase_atom_slot *slot =
+       kbase_atom_alloc(kd, bos, nbo, core_req, false);
+    if (!slot)
+@@ -3738,6 +3832,15 @@ kbase_kmod_job_submit_dep(struct pan_kmod_dev *dev, uint64_t jc,
+       __u64 seq_nr;
+       struct base_jd_atom atom;
+    } w = { .atom = atom };
++   if (kbase_defer.kd == kd) {
++      if (kbase_defer.n == KBASE_DEFER_MAX)
++         kbase_defer_flush();
++      memcpy(kbase_defer.buf + kbase_defer.n * kd->atom_stride,
++             kd->atom_seq_nr ? (const void *)&w : (const void *)&atom,
++             kd->atom_stride);
++      kbase_defer.slots[kbase_defer.n++] = slot;
++      return atom.atom_number;
++   }
+    struct kbase_ioctl_job_submit sub = {
+       .addr = kd->atom_seq_nr ? (uintptr_t)&w : (uintptr_t)&atom,
+       .nr_atoms = 1,
+@@ -3820,6 +3923,7 @@ kbase_kmod_jm_export_fence(struct pan_kmod_dev *dev, uint64_t dep0,
+          close(fd);
+    }
+ 
++   kbase_defer_flush();
+    struct kbase_atom_slot *slot =
+       kbase_atom_alloc(kd, NULL, 0, KBASE_JD_REQ_SOFT_FENCE_TRIGGER, true);
+    if (!slot)
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.h b/src/panfrost/lib/kmod/kbase_kmod.h
+index df1c5d07704..60bb6db25aa 100644
+--- a/src/panfrost/lib/kmod/kbase_kmod.h
++++ b/src/panfrost/lib/kmod/kbase_kmod.h
+@@ -57,6 +57,10 @@ bool kbase_kmod_job_submit_retry(struct pan_kmod_dev *dev, uint64_t jc,
+ bool kbase_kmod_atom_is_done(struct pan_kmod_dev *dev, uint64_t atom_number);
+ int kbase_kmod_jm_export_fence(struct pan_kmod_dev *dev, uint64_t dep0,
+                                uint64_t dep1);
++/* JM: batch the atoms submitted on this thread between these two calls
++ * into one JOB_SUBMIT (see kbase_defer). */
++void kbase_kmod_jm_defer_begin(struct pan_kmod_dev *dev);
++void kbase_kmod_jm_defer_end(struct pan_kmod_dev *dev);
+ bool kbase_kmod_wait_atom(struct pan_kmod_dev *dev, uint64_t atom_number,
+                          int64_t timeout_ns);
+ /* Bytes of physical memory the kernel has committed to a BO (a
+diff --git a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+index 46cbcf45dbd..b56947dd595 100644
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -208,6 +208,18 @@ struct panvk_cmd_buffer {
+       uint32_t gpu_prerast_inst_base;
+ #endif
+       bool uses_poly_heap;
++      /* jm-v7 127: the last push uniform block of up to two shaders
++       * (vertex and fragment), reused when a draw's block is identical. */
++      struct {
++         const void *shader;
++         uint32_t count;
++         uint64_t gpu;
++         uint64_t data[64];
++      } push_reuse[2];
++      uint8_t push_reuse_next;
++      /* Set only around the main draw path's push uniform calls for draws
++       * whose blocks the GPU does not patch (not indirect). */
++      bool push_reuse_allowed;
+    } state;
+ };
+ 
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index d36012ee4a4..8d13e1f056e 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -2039,12 +2039,20 @@ panvk_cmd_prepare_draw_link_shaders(struct panvk_cmd_buffer *cmd)
+       fs = NULL;
+    }
+ 
++   if (gfx->link_key[0] == vs && gfx->link_key[1] == gs &&
++       gfx->link_key[2] == fs)
++      return VK_SUCCESS;
++
+    VkResult result =
+       panvk_per_arch(link_shaders)(&cmd->desc_pool, vs, gs, fs, &gfx->link);
+    if (result != VK_SUCCESS) {
++      gfx->link_key[0] = gfx->link_key[1] = gfx->link_key[2] = NULL;
+       vk_command_buffer_set_error(&cmd->vk, result);
+       return result;
+    }
++   gfx->link_key[0] = vs;
++   gfx->link_key[1] = gs;
++   gfx->link_key[2] = fs;
+ 
+    return VK_SUCCESS;
+ }
+@@ -2379,6 +2387,10 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
+       gfx_state_set_dirty(cmdbuf, VS_PUSH_UNIFORMS);
+    }
+ 
++   /* jm-v7 127: blocks may be shared by draws only when no indirect
++    * helper patches sysvals into them on the GPU. */
++   cmdbuf->state.push_reuse_allowed = !draw->info.indirect.buffer_dev_addr;
++
+    /* Pushed uniform buffer words (jm-v7 105) follow the bound buffers and
+     * their contents: uploaded with every draw. */
+    if (!push_cache || !cmdbuf->state.gfx.vs.push_uniforms ||
+@@ -2403,6 +2415,7 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
+          return result;
+       cmdbuf->state.gfx.fs.push_uniforms = fs_push_uniforms.gpu;
+    }
++   cmdbuf->state.push_reuse_allowed = false;
+ 
+    result = panvk_draw_prepare_tiler_context(cmdbuf, draw);
+    if (result != VK_SUCCESS)
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index 1d0d7cd8381..00ab3da738a 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -231,6 +231,23 @@ static unsigned panvk_diag_hist_n;
+ static bool panvk_diag_hist_dumped;
+ static simple_mtx_t panvk_diag_hist_lock = SIMPLE_MTX_INITIALIZER;
+ 
++/* jm-v7 126: the job history's clock. clock_gettime() was a real system
++ * call on the Galaxy A51's kernel (vDSO off for its timer), 1.2% of
++ * ARMSX2's render thread for one call per atom; the history only needs
++ * relative milliseconds, so the virtual counter is read directly. */
++static inline uint64_t
++panvk_diag_now_ns(void)
++{
++#if defined(__aarch64__)
++   uint64_t cnt, frq;
++   __asm__ volatile("mrs %0, cntvct_el0" : "=r"(cnt));
++   __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
++   if (frq)
++      return (uint64_t)((__uint128_t)cnt * 1000000000ull / frq);
++#endif
++   return os_time_get_nano();
++}
++
+ static void
+ panvk_diag_hist_done(unsigned atom)
+ {
+@@ -238,7 +255,7 @@ panvk_diag_hist_done(unsigned atom)
+    for (unsigned i = 0; i < 128 && i < panvk_diag_hist_n; i++) {
+       struct panvk_diag_hist *h = &panvk_diag_hist[(panvk_diag_hist_n - 1 - i) & 127];
+       if (h->atom == atom && !h->done_ns) {
+-         h->done_ns = os_time_get_nano();
++         h->done_ns = panvk_diag_now_ns();
+          break;
+       }
+    }
+@@ -263,7 +280,7 @@ panvk_diag_atom_failed(unsigned atom)
+    simple_mtx_lock(&panvk_diag_hist_lock);
+    if (!panvk_diag_hist_dumped && panvk_diag_hist_n) {
+       panvk_diag_hist_dumped = true;
+-      const uint64_t now = os_time_get_nano();
++      const uint64_t now = panvk_diag_now_ns();
+       const unsigned n = MIN2(panvk_diag_hist_n, 128);
+       mesa_loge("panvk: last %u atoms before the failure (ms before now):", n);
+       panvk_errlog("last %u jobs before the failure (ms before now):", n);
+@@ -437,6 +454,10 @@ panvk_gprof_report_locked(uint64_t now)
+       const uint64_t dcg = p_atomic_xchg(&panvk_mem_stats.desc_copy_gpu, 0);
+       mesa_logi("GPROF descriptor copies/s: CPU %.0f, GPU job %.0f",
+                 dcc / secs, dcg / secs);
++      const uint64_t prh = p_atomic_xchg(&panvk_mem_stats.push_reuse_hit, 0);
++      const uint64_t prm = p_atomic_xchg(&panvk_mem_stats.push_reuse_miss, 0);
++      mesa_logi("GPROF push uniform blocks/s: reused %.0f, new %.0f",
++                prh / secs, prm / secs);
+       mesa_logi("GPROF render pass merge candidates/s: same targets+load %.0f, "
+                 "no batch between %.0f, no barrier between %.0f",
+                 rm[0] / secs, rm[1] / secs, rm[2] / secs);
+@@ -606,7 +627,7 @@ panvk_diag_note_atom(uint64_t atom, const char *kind,
+    if (panvk_gprof_on() || hist_on) {
+       simple_mtx_lock(&panvk_diag_hist_lock);
+       struct panvk_diag_hist *h = &panvk_diag_hist[panvk_diag_hist_n++ & 127];
+-      h->submit_ns = os_time_get_nano();
++      h->submit_ns = panvk_diag_now_ns();
+       h->done_ns = 0;
+       h->atom = atom & 255;
+       panvk_diag_rec_fill(&h->rec, kind, batch);
+@@ -1025,6 +1046,9 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+          return result;
+    }
+ 
++   /* jm-v7 125: one JOB_SUBMIT for all the atoms below. */
++   kbase_kmod_jm_defer_begin(dev->kmod.dev);
++
+    for (uint32_t j = 0; j < submit->command_buffer_count; ++j) {
+       struct panvk_cmd_buffer *cmdbuf =
+          container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk);
+@@ -1079,6 +1103,8 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
+       }
+    }
+ 
++   kbase_kmod_jm_defer_end(dev->kmod.dev);
++
+ 
+    if (queue->in_dep) {
+       if (ntargets < PANVK_KBASE_SYNC_TARGET_COUNT)
+diff --git a/src/panfrost/vulkan/panvk_cmd_draw.h b/src/panfrost/vulkan/panvk_cmd_draw.h
+index 2db4158d8c9..dd526272b7b 100644
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -227,6 +227,9 @@ struct panvk_cmd_graphics_state {
+ 
+ #if PAN_ARCH < 9
+    struct panvk_shader_link link;
++   /* jm-v7 129: the shaders `link` was built for; a rebind of the same
++    * pair does not relink (its descriptors live until the reset). */
++   const void *link_key[3];
+ #endif
+ 
+    struct {
+diff --git a/src/panfrost/vulkan/panvk_priv_bo.h b/src/panfrost/vulkan/panvk_priv_bo.h
+index 365cb31cb14..bbb149dd3cf 100644
+--- a/src/panfrost/vulkan/panvk_priv_bo.h
++++ b/src/panfrost/vulkan/panvk_priv_bo.h
+@@ -69,6 +69,8 @@ struct panvk_mem_stats {
+    uint64_t rp_merge[3];
+    /* Descriptor copies done on the CPU / by a desc_copy job (jm-v7 122). */
+    uint64_t desc_copy_cpu, desc_copy_gpu;
++   /* Push uniform blocks reused / built (jm-v7 127). */
++   uint64_t push_reuse_hit, push_reuse_miss;
+ };
+ 
+ extern struct panvk_mem_stats panvk_mem_stats;
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c b/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
+index 049a8750eca..d5a5e45a44e 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_push_constant.c
+@@ -40,6 +40,67 @@ read_pushed_ubo_word(const struct panvk_descriptor_state *desc_state,
+ }
+ #endif
+ 
++/* One push uniform block of total_count words, for a block at block_gpu
++ * (the common sysvals can hold that address), into out[]. */
++static void
++build_push_block(struct panvk_cmd_buffer *cmdbuf,
++                 const struct panvk_shader_variant *shader, uint64_t block_gpu,
++                 uint64_t *out, uint64_t *sysvals,
++                 const struct panvk_descriptor_state *desc_state)
++{
++   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
++   struct panvk_common_sysvals_inner common_inner = {
++      .printf_buffer_address = dev->printf.bo->addr.dev,
++#if PAN_ARCH < 9
++      .constant_data = panvk_priv_mem_dev_addr(shader->data_mem),
++#endif
++      .push_uniforms = block_gpu,
++   };
++   uint64_t *common = (uint64_t *)&common_inner;
++   uint64_t *push_consts = cmdbuf->state.push_constants.data;
++   const struct pan_fau_layout *fau = &shader->info.fau;
++   uint32_t fau_idx = 0, w;
++
++   memset(out, 0, shader->fau.total_count * sizeof(uint64_t));
++
++   /* After packing, the sysvals come first, followed by the user push
++    * constants. The ordering is encoded shader side, so don't re-order
++    * these loops. */
++   BITSET_FOREACH_SET(w, shader->fau.used_sysvals, MAX_SYSVAL_FAUS) {
++      if (w >= SYSVALS_COMMON_START && w < SYSVALS_COMMON_END)
++         out[fau_idx++] = common[w - SYSVALS_COMMON_START];
++      else
++         out[fau_idx++] = sysvals[w];
++   }
++
++   BITSET_FOREACH_SET(w, shader->fau.used_push_consts, MAX_PUSH_CONST_FAUS)
++      out[fau_idx++] = push_consts[w];
++   assert(fau_idx <= shader->fau.total_count);
++
++   pan_fau_foreach_imm(fau, i) {
++      bool hi = (i & 1) != 0;
++      unsigned idx = i / 2;
++      assert(fau_idx <= idx && idx < shader->fau.total_count);
++
++      out[idx] = (out[idx] & ((uint64_t)UINT32_MAX << (32 * !hi))) |
++                 ((uint64_t)fau->words[i].constant << (32 * hi));
++   }
++
++#if PAN_ARCH < 9
++   pan_fau_foreach_reloc(fau, i) {
++      bool hi = (i & 1) != 0;
++      unsigned idx = i / 2;
++      assert(fau_idx <= idx && idx < shader->fau.total_count);
++
++      const uint32_t v =
++         desc_state ? read_pushed_ubo_word(desc_state, fau->words[i].relocation)
++                    : 0;
++      out[idx] = (out[idx] & ((uint64_t)UINT32_MAX << (32 * !hi))) |
++                 ((uint64_t)v << (32 * hi));
++   }
++#endif
++}
++
+ static VkResult
+ prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
+                       const struct panvk_shader_variant *shader,
+@@ -47,14 +108,63 @@ prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
+                       uint64_t *sysvals,
+                       const struct panvk_descriptor_state *desc_state)
+ {
+-   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+-
+    if (!shader->fau.total_count) {
+       push_uniforms->cpu = NULL;
+       push_uniforms->gpu = 0;
+       return VK_SUCCESS;
+    }
+ 
++#if PAN_ARCH < 9
++   /* jm-v7 127: most draws of a pass push the same block again (ARMSX2:
++    * prepare_push_uniforms was 3.6% of its render thread). Build it as if
++    * it lived at the previous block's address (the common sysvals can hold
++    * the block's own address) and reuse that block if nothing differs.
++    * In ARMSX2 only about a quarter of the blocks matched and the trial
++    * builds cost what the hits saved, so it is off by default:
++    * PANVK_PUSH_REUSE=1 turns it on. */
++   static int reuse_on = -1;
++   if (reuse_on < 0) {
++      const char *e = getenv("PANVK_PUSH_REUSE");
++      reuse_on = e && e[0] == '1';
++   }
++   const bool reuse = reuse_on && cmdbuf->state.push_reuse_allowed &&
++                      repeat_count == 1 && shader->fau.total_count <= 64;
++   if (reuse) {
++      /* A block whose shader does not read its own address (the common
++       * push_uniforms sysval) is the same wherever it lives: on a miss the
++       * trial build is copied to the new block, no second build. */
++      const bool self_addr =
++         BITSET_TEST(shader->fau.used_sysvals, SYSVALS_COMMON_START);
++      const size_t sz = shader->fau.total_count * sizeof(uint64_t);
++      for (unsigned e = 0; e < 2; e++) {
++         struct panvk_cmd_buffer *cb = cmdbuf;
++         if (cb->state.push_reuse[e].shader != shader ||
++             cb->state.push_reuse[e].count != shader->fau.total_count)
++            continue;
++         uint64_t tmp[64];
++         build_push_block(cmdbuf, shader, cb->state.push_reuse[e].gpu, tmp,
++                          sysvals, desc_state);
++         if (!memcmp(tmp, cb->state.push_reuse[e].data, sz)) {
++            p_atomic_inc(&panvk_mem_stats.push_reuse_hit);
++            push_uniforms->cpu = NULL;
++            push_uniforms->gpu = cb->state.push_reuse[e].gpu;
++            return VK_SUCCESS;
++         }
++         if (self_addr)
++            break;
++         *push_uniforms = panvk_cmd_alloc_dev_mem(cmdbuf, desc, sz,
++                                                  sizeof(uint64_t));
++         if (!push_uniforms->gpu)
++            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++         memcpy(push_uniforms->cpu, tmp, sz);
++         p_atomic_inc(&panvk_mem_stats.push_reuse_miss);
++         cb->state.push_reuse[e].gpu = push_uniforms->gpu;
++         memcpy(cb->state.push_reuse[e].data, tmp, sz);
++         return VK_SUCCESS;
++      }
++   }
++#endif
++
+    *push_uniforms = panvk_cmd_alloc_dev_mem(
+       cmdbuf, desc, shader->fau.total_count * sizeof(uint64_t) * repeat_count,
+       sizeof(uint64_t));
+@@ -62,82 +172,35 @@ prepare_push_uniforms(struct panvk_cmd_buffer *cmdbuf,
+    if (!push_uniforms->gpu)
+       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ 
+-   struct panvk_common_sysvals_inner common_inner = {
+-      .printf_buffer_address = dev->printf.bo->addr.dev,
+-#if PAN_ARCH < 9
+-      .constant_data = panvk_priv_mem_dev_addr(shader->data_mem),
+-#endif
+-   };
+-   uint64_t *common = (uint64_t *)&common_inner;
+-
+-   uint64_t *push_consts = cmdbuf->state.push_constants.data;
++   /* Each repeat owns its own contiguous block of total_count slots. Built
++    * in a cached stack buffer and copied to the (CPU-uncached) descriptor
++    * memory once. */
+    uint64_t *faus = push_uniforms->cpu;
+-   const struct pan_fau_layout *fau = &shader->info.fau;
+-   uint32_t w;
+-
+-   /* Build each block in a cached stack buffer and copy it to the
+-    * (CPU-uncached) descriptor memory once: the immediate and relocation
+-    * passes below merge 32-bit halves, and reading those back from device
+-    * memory made this function the top driver cost per draw in draw-heavy
+-    * games (ARMSX2). total_count is at most 64 words. */
+    uint64_t stage[64];
+    const bool staged = shader->fau.total_count <= ARRAY_SIZE(stage);
++   STACK_ARRAY(uint64_t, big, staged ? 1 : shader->fau.total_count);
++   uint64_t *blk = staged ? stage : big;
+ 
+    for (uint32_t r = 0; r < repeat_count; r++) {
+-      /* Each repeat owns its own contiguous block of total_count slots. */
+-      uint64_t *dst_faus = faus + r * shader->fau.total_count;
+-      uint64_t *repeat_faus = staged ? stage : dst_faus;
+-      uint32_t fau_idx = 0;
+-
+-      if (staged)
+-         memset(stage, 0, shader->fau.total_count * sizeof(uint64_t));
+-
+-      common_inner.push_uniforms =
++      const uint64_t block_gpu =
+          push_uniforms->gpu + r * shader->fau.total_count * sizeof(uint64_t);
+-
+-      /* After packing, the sysvals come first, followed by the user push
+-       * constants. The ordering is encoded shader side, so don't re-order
+-       * these loops. */
+-      BITSET_FOREACH_SET(w, shader->fau.used_sysvals, MAX_SYSVAL_FAUS) {
+-         if (w >= SYSVALS_COMMON_START && w < SYSVALS_COMMON_END)
+-            repeat_faus[fau_idx++] = common[w - SYSVALS_COMMON_START];
+-         else
+-            repeat_faus[fau_idx++] = sysvals[w];
+-      }
+-
+-      BITSET_FOREACH_SET(w, shader->fau.used_push_consts, MAX_PUSH_CONST_FAUS)
+-         repeat_faus[fau_idx++] = push_consts[w];
+-      assert(fau_idx <= shader->fau.total_count);
+-
+-      pan_fau_foreach_imm(fau, i) {
+-         bool hi = (i & 1) != 0;
+-         unsigned idx = i / 2;
+-         assert(fau_idx <= idx && idx < shader->fau.total_count);
+-
+-         repeat_faus[idx] =
+-            (repeat_faus[idx] & ((uint64_t)UINT32_MAX << (32 * !hi))) |
+-            ((uint64_t)fau->words[i].constant << (32 * hi));
+-      }
++      build_push_block(cmdbuf, shader, block_gpu, blk, sysvals, desc_state);
++      memcpy(faus + r * shader->fau.total_count, blk,
++             shader->fau.total_count * sizeof(uint64_t));
++   }
+ 
+ #if PAN_ARCH < 9
+-      pan_fau_foreach_reloc(fau, i) {
+-         bool hi = (i & 1) != 0;
+-         unsigned idx = i / 2;
+-         assert(fau_idx <= idx && idx < shader->fau.total_count);
+-
+-         const uint32_t v =
+-            desc_state ? read_pushed_ubo_word(desc_state,
+-                                              fau->words[i].relocation)
+-                       : 0;
+-         repeat_faus[idx] =
+-            (repeat_faus[idx] & ((uint64_t)UINT32_MAX << (32 * !hi))) |
+-            ((uint64_t)v << (32 * hi));
+-      }
+-#endif
+-
+-      if (staged)
+-         memcpy(dst_faus, stage, shader->fau.total_count * sizeof(uint64_t));
++   if (cmdbuf->state.push_reuse_allowed && repeat_count == 1 && staged) {
++      p_atomic_inc(&panvk_mem_stats.push_reuse_miss);
++      const unsigned e = cmdbuf->state.push_reuse_next++ & 1;
++      cmdbuf->state.push_reuse[e].shader = shader;
++      cmdbuf->state.push_reuse[e].count = shader->fau.total_count;
++      cmdbuf->state.push_reuse[e].gpu = push_uniforms->gpu;
++      memcpy(cmdbuf->state.push_reuse[e].data, stage,
++             shader->fau.total_count * sizeof(uint64_t));
+    }
++#endif
++   STACK_ARRAY_FINISH(big);
+ 
+    return VK_SUCCESS;
+ }
+-- 
+2.43.0
+

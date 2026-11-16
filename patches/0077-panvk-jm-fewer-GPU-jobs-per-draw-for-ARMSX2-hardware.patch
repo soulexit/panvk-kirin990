@@ -1,0 +1,686 @@
+From c7e9e8e18d36ff7523a58641ef375b47681e4410 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Sat, 14 Nov 2026 22:03:53 +0300
+Subject: [PATCH 77/78] panvk/jm: fewer GPU jobs per draw for ARMSX2,
+ hardware-side GPU profile aids
+
+Mali hardware counters on a Galaxy A51 (Mali-G72) in ARMSX2 (NFS Most
+Wanted) showed fragment work equal to the vendor driver's but 3.2x its
+vertex/tiler time per frame, from 3.25 GPU jobs per draw against 1.45.
+
+- Descriptor copies on the CPU (jm-v7 122): the per-draw desc_copy
+  compute job is replaced by the same copies done while recording, which
+  is valid because a bound descriptor set cannot change unless it is
+  UPDATE_AFTER_BIND. The job is kept for such sets, direct texture/sampler
+  tables and tables without a CPU mapping. PANVK_DESC_COPY_CPU=0: the job.
+- CPU index range for the PS2 emulators (jm-v7 123): the existing
+  record-time index scan (PANVK_V7_CPU_INDEX_RANGE) is on by default for
+  ARMSX2/AetherSX2/NetherSX2/PCSX2, which write their index stream before
+  recording. It removes the per-batch index range helper job, its barrier
+  and the GPU patching of every vertex job. A TRANSFER_DST index buffer
+  now only counts as GPU-written once a transfer write into it was
+  recorded (panvk_buffer::gpu_written).
+- GPU profile: the fragment shader hash of each batch (fs=, matches the
+  MESA_SPIRV_DUMP_PATH file name), descriptor copy and render pass merge
+  candidate counters; PANVK_IMG_LOG=1 logs each image's layout.
+
+NFS Most Wanted on the A51: 13 -> 17-18 fps (vendor driver 21.5), with
+PANVK_V7_IDVS=1. CTS on the A51 matches 1.0.002 with the defaults and
+with IDVS + CPU index range on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../vulkan/bifrost/panvk_vX_meta_desc_copy.c  | 145 ++++++++++++++++++
+ src/panfrost/vulkan/jm/panvk_cmd_buffer.h     |  13 ++
+ src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c  |   1 +
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c    |  92 ++++++++++-
+ src/panfrost/vulkan/jm/panvk_vX_cmd_query.c   |   1 +
+ src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c   |  14 +-
+ src/panfrost/vulkan/panvk_buffer.c            |  23 +++
+ src/panfrost/vulkan/panvk_buffer.h            |   4 +
+ src/panfrost/vulkan/panvk_cmd_desc_state.h    |   5 +
+ src/panfrost/vulkan/panvk_image.c             |  29 +++-
+ src/panfrost/vulkan/panvk_priv_bo.h           |   7 +
+ src/panfrost/vulkan/panvk_vX_cmd_desc_state.c |   8 +
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c       |  10 +-
+ src/panfrost/vulkan/panvk_vX_cmd_meta.c       |   3 +
+ 14 files changed, 345 insertions(+), 10 deletions(-)
+
+diff --git a/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c b/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c
+index ab4b1814d1a..ba0a772bbef 100644
+--- a/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c
++++ b/src/panfrost/vulkan/bifrost/panvk_vX_meta_desc_copy.c
+@@ -20,6 +20,10 @@
+ #include "panvk_device.h"
+ #include "panvk_meta.h"
+ #include "panvk_shader.h"
++#include "panvk_descriptor_set.h"
++#include "panvk_descriptor_set_layout.h"
++#include "panvk_priv_bo.h"
++#include "util/u_atomic.h"
+ 
+ struct pan_nir_desc_copy_info {
+    uint64_t sets[MAX_SETS];
+@@ -390,6 +394,140 @@ out:
+    return rsd;
+ }
+ 
++/* jm-v7 122: the copies the desc_copy job would do, done on the CPU while
++ * recording. ARMSX2 needed about one such compute job for every draw (NFS
++ * Most Wanted: 3.25 hardware jobs per draw against 1.45 with the vendor
++ * driver, and 3.2x its vertex/tiler time). A descriptor set cannot change
++ * after it is bound unless a binding is UPDATE_AFTER_BIND, so its contents
++ * at record time are the ones the job would read. Mirrors single_desc_copy()
++ * exactly (out-of-range entries are zeroed). Falls back to the job for
++ * UPDATE_AFTER_BIND sets, direct texture/sampler tables, sets without a CPU
++ * mapping and tables this command buffer did not allocate.
++ * PANVK_DESC_COPY_CPU=0: always use the job (A/B). */
++static bool
++panvk_desc_copy_cpu_on(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *e = getenv("PANVK_DESC_COPY_CPU");
++      on = !(e && e[0] == '0');
++   }
++   return on;
++}
++
++static bool
++cpu_desc_copy(const struct panvk_shader_desc_info *desc_info,
++              const struct panvk_descriptor_state *desc_state,
++              const struct panvk_shader_desc_state *sds,
++              const uint32_t limits[PANVK_BIFROST_DESC_TABLE_COUNT],
++              uint32_t attrib_buf_idx_offset)
++{
++   if (!panvk_desc_copy_cpu_on() || desc_info->direct_mask)
++      return false;
++
++   const uint32_t *map = panvk_priv_mem_host_addr(desc_info->others.map);
++   if (!map)
++      return false;
++
++   for (uint32_t i = 0; i < PANVK_BIFROST_DESC_TABLE_COUNT; i++) {
++      if (desc_info->others.count[i] && !sds->tables_cpu[i])
++         return false;
++   }
++   if (desc_info->others.count[PANVK_BIFROST_DESC_TABLE_IMG] &&
++       !sds->img_attrib_table_cpu)
++      return false;
++
++   const uint32_t total = limits[PANVK_BIFROST_DESC_TABLE_COUNT - 1];
++   /* Validate every source set first: nothing is written on a fallback. */
++   for (uint32_t c = 0; c < total; c++) {
++      const uint32_t set_idx = COPY_DESC_HANDLE_EXTRACT_TABLE(map[c]);
++      if (set_idx >= MAX_SETS)
++         return false;
++      const struct panvk_descriptor_set *set = desc_state->sets[set_idx];
++      if (!set)
++         continue; /* the job reads set_desc_counts[] = 0: zeroes */
++      if (!set->descs.host ||
++          (set->layout && (set->layout->flags &
++                           VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)))
++         return false;
++   }
++
++   for (uint32_t c = 0; c < total; c++) {
++      const uint32_t set_idx = COPY_DESC_HANDLE_EXTRACT_TABLE(map[c]);
++      const uint32_t src_idx = COPY_DESC_HANDLE_EXTRACT_INDEX(map[c]);
++      const struct panvk_descriptor_set *set = desc_state->sets[set_idx];
++      const bool valid = set && src_idx < set->desc_count;
++      const uint32_t *src =
++         valid ? (const uint32_t *)((const uint8_t *)set->descs.host +
++                                    (size_t)src_idx * PANVK_DESCRIPTOR_SIZE)
++               : NULL;
++
++      if (c < limits[PANVK_BIFROST_DESC_TABLE_UBO]) {
++         const unsigned sz = sizeof(struct mali_attribute_packed);
++         uint8_t *dst = (uint8_t *)sds->tables_cpu[PANVK_BIFROST_DESC_TABLE_UBO] +
++                        (size_t)c * sz;
++         if (valid)
++            memcpy(dst, src, sz);
++         else
++            memset(dst, 0, sz);
++      } else if (c < limits[PANVK_BIFROST_DESC_TABLE_IMG]) {
++         const uint32_t d = c - limits[PANVK_BIFROST_DESC_TABLE_UBO];
++         const unsigned buf_sz = pan_size(ATTRIBUTE_BUFFER) * 2;
++         uint32_t *attrib = (uint32_t *)((uint8_t *)sds->img_attrib_table_cpu +
++                                         (size_t)d * pan_size(ATTRIBUTE));
++         uint32_t *abuf =
++            (uint32_t *)((uint8_t *)sds->tables_cpu[PANVK_BIFROST_DESC_TABLE_IMG] +
++                         (size_t)d * buf_sz);
++         if (!valid) {
++            memset(abuf, 0, buf_sz);
++            memset(attrib, 0, pan_size(ATTRIBUTE));
++            continue;
++         }
++         const uint32_t buf_idx = d * 2 + attrib_buf_idx_offset;
++         if ((src[0] & BITFIELD_MASK(5)) == MALI_ATTRIBUTE_TYPE_1D) {
++            /* Texel buffer */
++            attrib[0] = (src[4] & ~BITFIELD_MASK(9)) | buf_idx;
++            attrib[1] = src[5];
++            abuf[0] = src[0];
++            abuf[1] = src[1];
++            abuf[2] = src[2] & BITFIELD_MASK(7);
++            abuf[3] = src[3];
++            abuf[4] = abuf[5] = abuf[6] = abuf[7] = 0;
++         } else {
++            /* Image */
++            attrib[0] = buf_idx | (src[2] & 0xfffffc00);
++            attrib[1] = 0;
++            abuf[0] = src[0];
++            abuf[1] = src[1];
++            abuf[2] = src[2] & BITFIELD_MASK(7);
++            for (unsigned k = 3; k < 8; k++)
++               abuf[k] = src[k];
++         }
++      } else if (c < limits[PANVK_BIFROST_DESC_TABLE_TEXTURE]) {
++         const uint32_t d = c - limits[PANVK_BIFROST_DESC_TABLE_IMG];
++         const unsigned sz = sizeof(struct mali_texture_packed);
++         uint8_t *dst =
++            (uint8_t *)sds->tables_cpu[PANVK_BIFROST_DESC_TABLE_TEXTURE] +
++            (size_t)d * sz;
++         if (valid)
++            memcpy(dst, src, sz);
++         else
++            memset(dst, 0, sz);
++      } else if (c < limits[PANVK_BIFROST_DESC_TABLE_SAMPLER]) {
++         const uint32_t d = c - limits[PANVK_BIFROST_DESC_TABLE_TEXTURE];
++         const unsigned sz = sizeof(struct mali_sampler_packed);
++         uint8_t *dst =
++            (uint8_t *)sds->tables_cpu[PANVK_BIFROST_DESC_TABLE_SAMPLER] +
++            (size_t)d * sz;
++         if (valid)
++            memcpy(dst, src, sz);
++         else
++            memset(dst, 0, sz);
++      }
++   }
++   return true;
++}
++
+ VkResult
+ panvk_per_arch(meta_get_copy_desc_job)(
+    struct panvk_cmd_buffer *cmdbuf,
+@@ -420,6 +558,13 @@ panvk_per_arch(meta_get_copy_desc_job)(
+          desc_info->others.count[i] +
+          (i > 0 ? copy_info.desc_copy.limits[i - 1] : 0);
+ 
++   if (cpu_desc_copy(desc_info, desc_state, shader_desc_state,
++                     copy_info.desc_copy.limits, attrib_buf_idx_offset)) {
++      p_atomic_inc(&panvk_mem_stats.desc_copy_cpu);
++      return VK_SUCCESS;
++   }
++   p_atomic_inc(&panvk_mem_stats.desc_copy_gpu);
++
+    for (uint32_t i = 0; i < ARRAY_SIZE(desc_state->sets); i++) {
+       const struct panvk_descriptor_set *set = desc_state->sets[i];
+ 
+diff --git a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+index 72287cdefb3..46cbcf45dbd 100644
+--- a/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
++++ b/src/panfrost/vulkan/jm/panvk_cmd_buffer.h
+@@ -111,6 +111,8 @@ struct panvk_batch {
+    struct {
+       uint32_t draws, gs, tess, xfb, fb_w, fb_h;
+       uint32_t dispatches, cs_hash, wg[3], local[3];
++      /* SPIR-V hash of the first draw's fragment shader (GPU profile). */
++      uint32_t fs_hash;
+       uintptr_t opener; /* return address of cmd_open_batch's caller */
+       int precomp; /* last precompiled kernel, -1 = none */
+       uint32_t precomp_n;
+@@ -142,6 +144,17 @@ struct panvk_cmd_buffer {
+     * the previous fragment job (panvk_dependency_needs_frag_done()). */
+    bool next_batch_after_frag;
+ 
++   /* GPU profile: the previous render pass, for counting merge
++    * candidates (panvk_mem_stats.rp_merge). */
++   struct {
++      VkImageView color[8], zs;
++      VkRect2D area;
++      const void *batch;
++      uint32_t barriers;
++      bool valid;
++   } prev_rp;
++   uint32_t barrier_count;
++
+    struct panvk_pool desc_pool;
+    struct panvk_pool varying_pool;
+    /* Growable GPU-only memory: geometry emulation of large tess draws. */
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index 4fed9c11f45..c9a444880e8 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -1074,6 +1074,7 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
+     * barrier flag set to true.
+     */
+    p_atomic_inc(&panvk_mem_stats.batch_why[cmdbuf->cur_batch ? 1 : 2]);
++   cmdbuf->barrier_count++;
+ 
+    if (cmdbuf->cur_batch) {
+       panvk_per_arch(cmd_close_batch)(cmdbuf);
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 95a319d74b7..d36012ee4a4 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -3215,6 +3215,19 @@ panvk_v7_select_alt_shaders(struct panvk_cmd_buffer *cmdbuf)
+       }
+    }
+ }
++
++/* GPU profile: SPIR-V hash of the batch's first fragment shader. */
++static inline void
++diag_note_fs(struct panvk_cmd_buffer *cmdbuf, struct panvk_batch *batch)
++{
++   if (batch->diag.fs_hash || !cmdbuf->state.gfx.fs.required)
++      return;
++   const struct panvk_shader_variant *fs =
++      panvk_shader_only_variant(get_fs(cmdbuf));
++   if (fs)
++      batch->diag.fs_hash = fs->diag_src_hash;
++}
++
+ #endif
+ 
+ static void
+@@ -3262,6 +3275,7 @@ panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
+    {
+       struct panvk_batch *db = cmdbuf->cur_batch;
+       db->diag.draws++;
++      diag_note_fs(cmdbuf, db);
+       if (cmdbuf->state.gfx.gs.shader)
+          db->diag.gs++;
+       if (draw->tess_phase)
+@@ -3394,6 +3408,7 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
+       return;
+ 
+    cmdbuf->cur_batch->diag.draws++;
++   diag_note_fs(cmdbuf, cmdbuf->cur_batch);
+ 
+    struct panvk_batch *batch = cmdbuf->cur_batch;
+    const struct vk_vertex_input_state *vi =
+@@ -4344,15 +4359,35 @@ panvk_per_arch(CmdDraw)(VkCommandBuffer commandBuffer, uint32_t vertexCount,
+  * adjacency), transform feedback, multiview or a vertex shader with side
+  * effects keep the GPU search, and so do sparse ranges.
+  */
++/* jm-v7 123: on by default for the PS2 emulators (ARMSX2 and its
++ * relatives), which write their index stream before recording each draw:
++ * NFS Most Wanted on a Galaxy A51 went from 15 to 17-18 fps with it. Off
++ * elsewhere; PANVK_V7_CPU_INDEX_RANGE=0/1 overrides both ways. */
++static bool
++cpu_index_range_app_default(void)
++{
++   const char *name = util_get_process_name();
++   if (!name)
++      return false;
++   static const char *const apps[] = {"armsx2", "aethersx2", "nethersx2",
++                                      "pcsx2"};
++   for (unsigned i = 0; i < ARRAY_SIZE(apps); i++) {
++      if (strcasestr(name, apps[i]))
++         return true;
++   }
++   return false;
++}
++
+ static bool
+ cpu_index_range_enabled(void)
+ {
+    static int v = -1;
+    if (v < 0) {
+       const char *e = getenv("PANVK_V7_CPU_INDEX_RANGE");
+-      v = e && e[0] && e[0] != '0';
++      v = e && e[0] ? e[0] != '0' : cpu_index_range_app_default();
+       if (v)
+-         mesa_logi("panvk: CPU index range search on");
++         mesa_logi("panvk: CPU index range search on (%s)",
++                   e && e[0] ? "PANVK_V7_CPU_INDEX_RANGE" : "app profile");
+    }
+    return v;
+ }
+@@ -7849,6 +7884,54 @@ panvk_per_arch(CmdBeginRendering)(VkCommandBuffer commandBuffer,
+ 
+    p_atomic_inc(&panvk_mem_stats.batch_why[0]);
+ 
++   /* GPU profile: could this pass be merged into the previous one? */
++   if (cmdbuf->prev_rp.valid && !resuming) {
++      bool same = pRenderingInfo->colorAttachmentCount <= 8 &&
++                  !memcmp(&pRenderingInfo->renderArea, &cmdbuf->prev_rp.area,
++                          sizeof(VkRect2D));
++      for (uint32_t i = 0; same && i < 8; i++) {
++         const VkRenderingAttachmentInfo *a =
++            i < pRenderingInfo->colorAttachmentCount
++               ? &pRenderingInfo->pColorAttachments[i] : NULL;
++         const VkImageView v = a ? a->imageView : VK_NULL_HANDLE;
++         same = v == cmdbuf->prev_rp.color[i] &&
++                (!v || a->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD);
++      }
++      const VkRenderingAttachmentInfo *zs =
++         pRenderingInfo->pDepthAttachment &&
++               pRenderingInfo->pDepthAttachment->imageView
++            ? pRenderingInfo->pDepthAttachment
++            : pRenderingInfo->pStencilAttachment;
++      const VkImageView zv = zs ? zs->imageView : VK_NULL_HANDLE;
++      same = same && zv == cmdbuf->prev_rp.zs &&
++             (!zv || zs->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD);
++      if (same) {
++         p_atomic_inc(&panvk_mem_stats.rp_merge[0]);
++         const void *tail = list_is_empty(&cmdbuf->batches)
++            ? NULL
++            : list_last_entry(&cmdbuf->batches, struct panvk_batch, node);
++         if (tail == cmdbuf->prev_rp.batch) {
++            p_atomic_inc(&panvk_mem_stats.rp_merge[1]);
++            if (cmdbuf->barrier_count == cmdbuf->prev_rp.barriers)
++               p_atomic_inc(&panvk_mem_stats.rp_merge[2]);
++         }
++      }
++   }
++
++   if (!resuming) {
++      for (uint32_t i = 0; i < 8; i++)
++         cmdbuf->prev_rp.color[i] = i < pRenderingInfo->colorAttachmentCount
++            ? pRenderingInfo->pColorAttachments[i].imageView : VK_NULL_HANDLE;
++      const VkRenderingAttachmentInfo *pzs =
++         pRenderingInfo->pDepthAttachment &&
++               pRenderingInfo->pDepthAttachment->imageView
++            ? pRenderingInfo->pDepthAttachment
++            : pRenderingInfo->pStencilAttachment;
++      cmdbuf->prev_rp.zs = pzs ? pzs->imageView : VK_NULL_HANDLE;
++      cmdbuf->prev_rp.area = pRenderingInfo->renderArea;
++      cmdbuf->prev_rp.valid = false;
++   }
++
+    /* When resuming from a suspended pass, the state should be unchanged. */
+    if (resuming && cmdbuf->cur_batch) {
+       state->render.flags = pRenderingInfo->flags;
+@@ -7922,6 +8005,11 @@ panvk_per_arch(CmdEndRendering2KHR)(
+       panvk_per_arch(cmd_close_batch)(cmdbuf);
+       cmdbuf->cur_batch = NULL;
+       panvk_per_arch(cmd_meta_resolve_attachments)(cmdbuf);
++      cmdbuf->prev_rp.batch = list_is_empty(&cmdbuf->batches)
++         ? NULL
++         : list_last_entry(&cmdbuf->batches, struct panvk_batch, node);
++      cmdbuf->prev_rp.barriers = cmdbuf->barrier_count;
++      cmdbuf->prev_rp.valid = true;
+ #if PAN_ARCH == 9
+       /* Outside the pass, timestamp and occlusion queries take one slot. */
+       cmdbuf->state.gfx.render.view_mask = 0;
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
+index c48017fe101..81959a19901 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_query.c
+@@ -546,6 +546,7 @@ panvk_per_arch(CmdCopyQueryPoolResults)(
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(panvk_query_pool, pool, queryPool);
+    VK_FROM_HANDLE(panvk_buffer, dst_buffer, dstBuffer);
++   dst_buffer->gpu_written = true;
+ 
+    /* XXX: Do we really need that barrier when EndQuery already handle it? */
+    if ((flags & VK_QUERY_RESULT_WAIT_BIT) && cmd->cur_batch != NULL) {
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+index ce851c020a7..1d0d7cd8381 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c
+@@ -430,6 +430,16 @@ panvk_gprof_report_locked(uint64_t now)
+                 "tile-local barriers %.0f",
+                 bw[0] / secs, bw[1] / secs, bw[2] / secs, bw[3] / secs,
+                 bw[4] / secs, bw[5] / secs);
++      uint64_t rm[3];
++      for (unsigned k = 0; k < 3; k++)
++         rm[k] = p_atomic_xchg(&panvk_mem_stats.rp_merge[k], 0);
++      const uint64_t dcc = p_atomic_xchg(&panvk_mem_stats.desc_copy_cpu, 0);
++      const uint64_t dcg = p_atomic_xchg(&panvk_mem_stats.desc_copy_gpu, 0);
++      mesa_logi("GPROF descriptor copies/s: CPU %.0f, GPU job %.0f",
++                dcc / secs, dcg / secs);
++      mesa_logi("GPROF render pass merge candidates/s: same targets+load %.0f, "
++                "no batch between %.0f, no barrier between %.0f",
++                rm[0] / secs, rm[1] / secs, rm[2] / secs);
+    }
+    for (unsigned r = 0; r < 16; r++) {
+       int best = -1;
+@@ -528,7 +538,7 @@ panvk_gprof_submit(uint64_t atom, const char *kind,
+       op -= (uintptr_t)dli.dli_fbase;
+    snprintf(sig, sizeof(sig),
+             "%s op=%lx pc=%d/%u fb=%ux%u rp=%ux%u s%u c%u z%u ld%x/%u%s%s%s "
+-            "cs=%08x wg=%ux%ux%u l=%ux%u",
++            "cs=%08x wg=%ux%ux%u l=%ux%u fs=%08x",
+             kind, (unsigned long)op, batch->diag.precomp,
+             batch->diag.precomp_n, batch->diag.fb_w, batch->diag.fb_h,
+             batch->diag.rp_w, batch->diag.rp_h, batch->diag.rp_samples,
+@@ -538,7 +548,7 @@ panvk_gprof_submit(uint64_t atom, const char *kind,
+             batch->diag.xfb ? " xfb" : "",
+             batch->diag.dispatches ? batch->diag.cs_hash : 0,
+             batch->diag.wg[0], batch->diag.wg[1], batch->diag.wg[2],
+-            batch->diag.local[0], batch->diag.local[1]);
++            batch->diag.local[0], batch->diag.local[1], batch->diag.fs_hash);
+    simple_mtx_lock(&panvk_gprof_lock);
+    int k = -1;
+    for (unsigned i = 0; i < panvk_gprof_nkinds; i++)
+diff --git a/src/panfrost/vulkan/panvk_buffer.c b/src/panfrost/vulkan/panvk_buffer.c
+index 69970c13dc7..595af69807e 100644
+--- a/src/panfrost/vulkan/panvk_buffer.c
++++ b/src/panfrost/vulkan/panvk_buffer.c
+@@ -11,6 +11,7 @@
+ #include "pan_props.h"
+ 
+ #include "vk_log.h"
++#include "vk_common_entrypoints.h"
+ 
+ VKAPI_ATTR uint64_t VKAPI_CALL
+ panvk_GetBufferOpaqueCaptureAddress(VkDevice _device,
+@@ -212,3 +213,25 @@ panvk_DestroyBuffer(VkDevice _device, VkBuffer _buffer,
+ 
+    vk_buffer_destroy(&device->vk, pAllocator, &buffer->vk);
+ }
++
++/* jm-v7 123: mark buffers that recorded transfer commands write (see
++ * panvk_buffer::gpu_written), then let the runtime lower the copy. */
++VKAPI_ATTR void VKAPI_CALL
++panvk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
++                     const VkCopyBufferInfo2 *pCopyBufferInfo)
++{
++   VK_FROM_HANDLE(panvk_buffer, dst, pCopyBufferInfo->dstBuffer);
++   if (dst)
++      dst->gpu_written = true;
++   vk_common_CmdCopyBuffer2(commandBuffer, pCopyBufferInfo);
++}
++
++VKAPI_ATTR void VKAPI_CALL
++panvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
++                            const VkCopyImageToBufferInfo2 *pCopyImageToBufferInfo)
++{
++   VK_FROM_HANDLE(panvk_buffer, dst, pCopyImageToBufferInfo->dstBuffer);
++   if (dst)
++      dst->gpu_written = true;
++   vk_common_CmdCopyImageToBuffer2(commandBuffer, pCopyImageToBufferInfo);
++}
+diff --git a/src/panfrost/vulkan/panvk_buffer.h b/src/panfrost/vulkan/panvk_buffer.h
+index 3698ab07e27..fb66132b16a 100644
+--- a/src/panfrost/vulkan/panvk_buffer.h
++++ b/src/panfrost/vulkan/panvk_buffer.h
+@@ -19,6 +19,10 @@ struct panvk_buffer {
+    /* Bound memory, for the CPU index range of jm-v7 104. */
+    struct panvk_device_memory *mem;
+    uint64_t mem_offset;
++   /* jm-v7 123: a transfer command writing this buffer was recorded (copy,
++    * fill, update, query results). Until then a TRANSFER_DST buffer only
++    * holds what the CPU wrote, for the CPU index range. Sticky. */
++   bool gpu_written;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(panvk_buffer, vk.base, VkBuffer,
+diff --git a/src/panfrost/vulkan/panvk_cmd_desc_state.h b/src/panfrost/vulkan/panvk_cmd_desc_state.h
+index f88ad3a97cf..dcb68188c85 100644
+--- a/src/panfrost/vulkan/panvk_cmd_desc_state.h
++++ b/src/panfrost/vulkan/panvk_cmd_desc_state.h
+@@ -31,6 +31,11 @@ struct panvk_shader_desc_state {
+ #if PAN_ARCH < 9
+    uint64_t tables[PANVK_BIFROST_DESC_TABLE_COUNT];
+    uint64_t img_attrib_table;
++   /* CPU mappings of the tables allocated by
++    * cmd_prepare_shader_desc_tables(), NULL for tables it did not allocate
++    * (direct, dummy sampler): the CPU descriptor copy needs them. */
++   void *tables_cpu[PANVK_BIFROST_DESC_TABLE_COUNT];
++   void *img_attrib_table_cpu;
+    uint64_t dyn_ssbos;
+    /* Direct base the texture/sampler tables were built with. */
+    uint64_t direct_base;
+diff --git a/src/panfrost/vulkan/panvk_image.c b/src/panfrost/vulkan/panvk_image.c
+index ac1803c09f5..afae9b2c49c 100644
+--- a/src/panfrost/vulkan/panvk_image.c
++++ b/src/panfrost/vulkan/panvk_image.c
+@@ -373,8 +373,8 @@ panvk_image_get_mod_from_list(struct panvk_image *image,
+ }
+ 
+ static uint64_t
+-panvk_image_get_mod(struct panvk_image *image,
+-                    const VkImageCreateInfo *pCreateInfo)
++panvk_image_get_mod_impl(struct panvk_image *image,
++                         const VkImageCreateInfo *pCreateInfo)
+ {
+    struct pan_image_usage iusage = get_iusage(image, pCreateInfo);
+ 
+@@ -406,6 +406,31 @@ panvk_image_get_mod(struct panvk_image *image,
+    return panvk_image_get_mod_from_list(image, &iusage, NULL, 0);
+ }
+ 
++/* PANVK_IMG_LOG=1: one line per image with the layout it got (GPU profile:
++ * linear render targets and textures are slow to sample and to write). */
++static uint64_t
++panvk_image_get_mod(struct panvk_image *image,
++                    const VkImageCreateInfo *pCreateInfo)
++{
++   const uint64_t mod = panvk_image_get_mod_impl(image, pCreateInfo);
++   static int log = -1;
++   if (log < 0) {
++      const char *e = getenv("PANVK_IMG_LOG");
++      log = e && e[0] == '1';
++   }
++   if (log)
++      mesa_logi("IMGLOG fmt %d %ux%u mips %u layers %u samples %u tiling %d "
++                "usage 0x%x flags 0x%x -> mod 0x%" PRIx64 " (%s)",
++                image->vk.format, image->vk.extent.width,
++                image->vk.extent.height, image->vk.mip_levels,
++                image->vk.array_layers, image->vk.samples, image->vk.tiling,
++                (unsigned)image->vk.usage, (unsigned)image->vk.create_flags, mod,
++                drm_is_afbc(mod) ? "afbc"
++                : mod == DRM_FORMAT_MOD_LINEAR ? "LINEAR"
++                : "tiled");
++   return mod;
++}
++
+ static bool
+ is_disjoint(const struct panvk_image *image)
+ {
+diff --git a/src/panfrost/vulkan/panvk_priv_bo.h b/src/panfrost/vulkan/panvk_priv_bo.h
+index 73d9eb5b83b..365cb31cb14 100644
+--- a/src/panfrost/vulkan/panvk_priv_bo.h
++++ b/src/panfrost/vulkan/panvk_priv_bo.h
+@@ -62,6 +62,13 @@ struct panvk_mem_stats {
+     * split an open batch, a barrier without one, EndRendering, a no-op
+     * barrier skipped. */
+    uint64_t batch_why[6];
++   /* Render pass merge candidates (GPU profile): a pass on the same
++    * attachments and area as the previous one that loads them all; of
++    * those, nothing else got a batch in between; of those, no barrier in
++    * between either. */
++   uint64_t rp_merge[3];
++   /* Descriptor copies done on the CPU / by a desc_copy job (jm-v7 122). */
++   uint64_t desc_copy_cpu, desc_copy_gpu;
+ };
+ 
+ extern struct panvk_mem_stats panvk_mem_stats;
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c b/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
+index 0b1e81cca96..38385e6b30d 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_desc_state.c
+@@ -215,6 +215,10 @@ panvk_per_arch(cmd_prepare_shader_desc_tables)(
+    bool fill_image_table,
+    struct panvk_shader_desc_state *shader_desc_state)
+ {
++   memset(shader_desc_state->tables_cpu, 0,
++          sizeof(shader_desc_state->tables_cpu));
++   shader_desc_state->img_attrib_table_cpu = NULL;
++
+    for (uint32_t i = 0; i < ARRAY_SIZE(desc_info->others.count); i++) {
+       uint32_t desc_count =
+          desc_info->others.count[i] +
+@@ -231,6 +235,7 @@ panvk_per_arch(cmd_prepare_shader_desc_tables)(
+          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ 
+       shader_desc_state->tables[i] = ptr.gpu;
++      shader_desc_state->tables_cpu[i] = ptr.cpu;
+ 
+       if (i == PANVK_BIFROST_DESC_TABLE_UBO)
+          panvk_cmd_fill_dyn_ubos(desc_state, desc_info, ptr.cpu, desc_count);
+@@ -243,6 +248,7 @@ panvk_per_arch(cmd_prepare_shader_desc_tables)(
+             return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+ 
+          shader_desc_state->img_attrib_table = ptr.gpu;
++         shader_desc_state->img_attrib_table_cpu = ptr.cpu;
+       }
+    }
+ 
+@@ -256,10 +262,12 @@ panvk_per_arch(cmd_prepare_shader_desc_tables)(
+ 
+       if (desc_info->direct_mask & PANVK_DIRECT_TEX) {
+          shader_desc_state->tables[PANVK_BIFROST_DESC_TABLE_TEXTURE] = base;
++         shader_desc_state->tables_cpu[PANVK_BIFROST_DESC_TABLE_TEXTURE] = NULL;
+          tex_count = 1;
+       }
+       if (desc_info->direct_mask & PANVK_DIRECT_SAMPLER) {
+          shader_desc_state->tables[PANVK_BIFROST_DESC_TABLE_SAMPLER] = base;
++         shader_desc_state->tables_cpu[PANVK_BIFROST_DESC_TABLE_SAMPLER] = NULL;
+          sampler_count = 1;
+       }
+    }
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+index 4d4e86a3df6..7de7266c2dd 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -1219,16 +1219,18 @@ panvk_per_arch(CmdBindIndexBuffer2)(VkCommandBuffer commandBuffer,
+ #if PAN_ARCH < 9
+       cmdbuf->state.gfx.ib.mem = buf->mem;
+       cmdbuf->state.gfx.ib.mem_offset = buf->mem_offset + offset;
+-      /* Every usage through which the GPU could write the buffer (same rule
+-       * as the Exynos 9611 driver). */
++      /* Every usage through which a shader could write the buffer (same
++       * rule as the Exynos 9611 driver). TRANSFER_DST alone only counts
++       * once a transfer write into it was recorded (jm-v7 123): ARMSX2's
++       * index stream buffer has the flag but is only written by the CPU. */
+       const VkBufferUsageFlags2KHR gpu_writes =
+-         VK_BUFFER_USAGE_2_TRANSFER_DST_BIT_KHR |
+          VK_BUFFER_USAGE_2_STORAGE_TEXEL_BUFFER_BIT_KHR |
+          VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT_KHR |
+          VK_BUFFER_USAGE_2_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+          VK_BUFFER_USAGE_2_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT |
+          VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT_KHR;
+-      cmdbuf->state.gfx.ib.cpu_written_only = !(buf->vk.usage & gpu_writes);
++      cmdbuf->state.gfx.ib.cpu_written_only =
++         !(buf->vk.usage & gpu_writes) && !buf->gpu_written;
+ #endif
+    } else {
+ #if PAN_ARCH < 9
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_meta.c b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+index 80384fa26b1..a145621b3f0 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_meta.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_meta.c
+@@ -2189,6 +2189,7 @@ panvk_per_arch(CmdFillBuffer)(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
+    struct panvk_physical_device *phys_dev =
+       to_panvk_physical_device(cmdbuf->vk.base.device->physical);
+ 
++   buffer->gpu_written = true;
+    uint64_t addr = panvk_buffer_gpu_ptr(buffer, dstOffset);
+    uint64_t range = panvk_buffer_range(buffer, dstOffset, fillSize) & ~3ULL;
+    if (!range)
+@@ -2238,6 +2239,8 @@ panvk_per_arch(CmdUpdateBuffer)(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+    struct panvk_cmd_meta_compute_save_ctx save = {0};
++   VK_FROM_HANDLE(panvk_buffer, dst, dstBuffer);
++   dst->gpu_written = true;
+ 
+    meta_compute_start(cmdbuf, &save);
+    vk_meta_update_buffer(&cmdbuf->vk, &dev->meta, dstBuffer, dstOffset,
+-- 
+2.43.0
+

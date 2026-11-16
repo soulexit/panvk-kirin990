@@ -1,0 +1,141 @@
+From c99ebca8a1d6d2bc1aa025f41b3562b11ddd5610 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 16 Nov 2026 20:32:31 +0300
+Subject: [PATCH 84/84] panvk/v7: drop unused gl_PointSize for IDVS, no IDVS
+ with adjacency
+
+The Bifrost compiler keeps a vertex shader that writes gl_PointSize off
+IDVS. NieR's NVN translator writes it in every vertex shader, so all its
+draws ran as separate vertex and tiler jobs. When the pipeline cannot
+draw points (static topology that is not a point list or an adjacency
+topology, no POINT polygon mode, no transform feedback), the write is
+removed before compiling. PANVK_V7_STRIP_PSIZ=0 keeps it. The condition
+is part of the shader cache key.
+
+A static adjacency topology without a geometry shader goes through the
+passthrough GS, which reads the vertex shader's varyings, so such a
+pipeline's vertex shader no longer gets IDVS either. That was already
+broken for shaders that do not write gl_PointSize.
+
+NieR:Automata (Switch recomp) on the P40 (G76): 18 -> 22-30 fps, all draws
+IDVS, vertex/tiler tasks 650k -> 59k/s, no glitches. A51 (G72) CTS:
+point size/topology list 21 fail + 2 crash -> 13 fail + 1 crash, no new
+failures; draw-order and regress lists unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_vX_shader.c | 70 ++++++++++++++++++++++++++-
+ 1 file changed, 68 insertions(+), 2 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 3fe1a62055c..f07b297acff 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -3142,6 +3142,50 @@ panvk_v7_vs_may_draw_nonfill(const struct vk_features *features,
+            BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_POLYGON_MODE) ||
+            state->rs->polygon_mode != VK_POLYGON_MODE_FILL);
+ }
++
++static bool
++panvk_v7_vk_topology_has_adjacency(VkPrimitiveTopology t)
++{
++   return t == VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY ||
++          t == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ||
++          t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY ||
++          t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
++}
++
++/* A vertex shader's gl_PointSize only matters when points are rasterized.
++ * The pipeline cannot draw points when its topology is known, static and
++ * not a point list, and it cannot draw in POINT polygon mode. Then the
++ * write is dropped: the Bifrost compiler keeps a shader that writes
++ * gl_PointSize off IDVS (NieR's NVN translator writes it in every vertex
++ * shader). PANVK_V7_STRIP_PSIZ=0 keeps it.
++ */
++static bool
++panvk_v7_vs_psiz_unused(const struct vk_features *features,
++                        const struct vk_graphics_pipeline_state *state)
++{
++   static int knob = -1;
++   if (knob < 0) {
++      const char *e = getenv("PANVK_V7_STRIP_PSIZ");
++      knob = !(e && e[0] == '0');
++   }
++   return knob && state && state->ia &&
++          !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY) &&
++          state->ia->primitive_topology != VK_PRIMITIVE_TOPOLOGY_POINT_LIST &&
++          !panvk_v7_vk_topology_has_adjacency(state->ia->primitive_topology) &&
++          !panvk_v7_vs_may_draw_nonfill(features, state);
++}
++
++/* A static adjacency topology without a geometry shader goes through the
++ * passthrough GS (prepare_draw()), which reads the vertex shader's
++ * varyings like the polygon-mode passthrough: no IDVS.
++ */
++static bool
++panvk_v7_vs_static_adjacency(const struct vk_graphics_pipeline_state *state)
++{
++   return state && state->ia &&
++          !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY) &&
++          panvk_v7_vk_topology_has_adjacency(state->ia->primitive_topology);
++}
+ #endif
+ 
+ static void
+@@ -3167,7 +3211,7 @@ panvk_hash_state(struct vk_physical_device *device,
+     * setting. The tag versions the knob set.
+     */
+    const int32_t v7_knobs[] = {
+-      0x76370105, /* knob set version (105: + push ubo) */
++      0x76370107, /* knob set version (107: + strip unused psiz, adjacency no idvs) */
+       panvk_v7_knob_tex_waterfall(),
+       panvk_v7_knob_idvs(),
+       panvk_v7_knob_desc_reorder(),
+@@ -3184,6 +3228,13 @@ panvk_hash_state(struct vk_physical_device *device,
+                            panvk_v7_vs_may_draw_nonfill(enabled_features,
+                                                         state);
+    _mesa_blake3_update(&blake3_ctx, &v7_nonfill, sizeof(v7_nonfill));
++   const bool v7_psiz_unused = (stages & VK_SHADER_STAGE_VERTEX_BIT) &&
++                               panvk_v7_vs_psiz_unused(enabled_features,
++                                                       state);
++   _mesa_blake3_update(&blake3_ctx, &v7_psiz_unused, sizeof(v7_psiz_unused));
++   const bool v7_adjacency = (stages & VK_SHADER_STAGE_VERTEX_BIT) &&
++                             panvk_v7_vs_static_adjacency(state);
++   _mesa_blake3_update(&blake3_ctx, &v7_adjacency, sizeof(v7_adjacency));
+ #endif
+ 
+    if (state != NULL) {
+@@ -5446,6 +5497,20 @@ panvk_compile_shader(struct panvk_device *dev,
+     * PANVK_V7_IDVS=0 keeps it off everywhere (A/B), =1 also allows it on
+     * the G71.
+     */
++   if (info->stage == MESA_SHADER_VERTEX && !vs_clip_space &&
++       !info->nir->xfb_info &&
++       panvk_v7_vs_psiz_unused(&dev->vk.enabled_features, state)) {
++      nir_variable *psiz = nir_find_variable_with_location(
++         info->nir, nir_var_shader_out, VARYING_SLOT_PSIZ);
++      if (psiz) {
++         psiz->data.mode = nir_var_shader_temp;
++         NIR_PASS(_, info->nir, nir_fixup_deref_modes);
++         NIR_PASS(_, info->nir, nir_remove_dead_variables,
++                  nir_var_shader_temp, NULL);
++         NIR_PASS(_, info->nir, nir_opt_dce);
++         info->nir->info.outputs_written &= ~VARYING_BIT_PSIZ;
++      }
++   }
+    if (info->stage == MESA_SHADER_VERTEX && !vs_clip_space) {
+       const int idvs_env = panvk_v7_knob_idvs();
+       const uint64_t gpu_id =
+@@ -5463,7 +5528,8 @@ panvk_compile_shader(struct panvk_device *dev,
+        * reproduce. The G71 (0x6000) was never tested and keeps it off. */
+       const bool idvs_quirk = PAN_ARCH == 6 && prod == 0x6000 /* G71 */;
+       const bool polygon_mode =
+-         panvk_v7_vs_may_draw_nonfill(&dev->vk.enabled_features, state);
++         panvk_v7_vs_may_draw_nonfill(&dev->vk.enabled_features, state) ||
++         panvk_v7_vs_static_adjacency(state);
+       nir_shader_gather_info(info->nir, nir_shader_get_entrypoint(info->nir));
+       const bool writes_memory = info->nir->info.writes_memory;
+ 
+-- 
+2.43.0
+

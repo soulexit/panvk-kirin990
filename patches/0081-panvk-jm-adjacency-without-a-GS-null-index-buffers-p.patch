@@ -1,0 +1,388 @@
+From d5d199e3614e28a4b1c67598a4e3fbc7b4beb866 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Sun, 15 Nov 2026 22:04:03 +0300
+Subject: [PATCH 81/84] panvk/jm: adjacency without a GS, null index buffers,
+ polygon-mode depth bias
+
+Three dEQP-VK groups that failed on the Mali-G76 (JM v7), plus a draw
+helper bug the regress run found:
+
+- *_with_adjacency topologies without a geometry shader: translate_prim()
+  has no adjacency modes on v7 (the tiler has none), so these draws hit
+  UNREACHABLE and the tiler got a garbage draw mode (wrong pixels or
+  DEVICE_LOST). They now go through the passthrough GS of their adjacency
+  class, which drops the adjacent vertices; passthrough_gs() builds it for
+  a screen-space vertex shader too.
+- maintenance6 + nullDescriptor null index buffer: v7 bound address 0
+  (faulted) with size 0 (indirect draws were skipped). It now binds the
+  device's zero page with its size (PANVK_NULL_ZERO_SIZE, moved to
+  panvk_device.h).
+- Depth bias in LINE/POINT polygon mode: the polygon-mode passthrough emits
+  lines/points, which the tiler does not bias. The GS now computes the bias
+  of each triangle the way llvmpipe does and adds it to clip z. The
+  parameters use the panvk_gs_push padding words.
+- draw_helper.cl: an indexed indirect draw that reads no index (indexCount 0
+  or only restart indices) wrapped vertex_range to 2 or ~2^32 and ran the
+  vertex job at a vertex index near 2^32. Such a draw now gets NULL jobs.
+
+P40: the 121 adjacency, 16 maintenance6 and 1616 depth_bias cases all pass
+or are NotSupported. regress.txt: 18847 pass, 1 fail
+(memory_model.message_passing.permuted_index.barrier, also in the
+1004poff baseline).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/libpan/draw_helper.cl         |  8 ++-
+ src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c | 57 ++++++++++++++++++--
+ src/panfrost/vulkan/panvk_device.h         |  4 +-
+ src/panfrost/vulkan/panvk_gs.h             | 19 ++++---
+ src/panfrost/vulkan/panvk_shader.h         | 11 ++--
+ src/panfrost/vulkan/panvk_vX_cmd_draw.c    | 15 +++++-
+ src/panfrost/vulkan/panvk_vX_device.c      |  1 -
+ src/panfrost/vulkan/panvk_vX_shader.c      | 62 +++++++++++++++++++++-
+ 8 files changed, 156 insertions(+), 21 deletions(-)
+
+diff --git a/src/panfrost/libpan/draw_helper.cl b/src/panfrost/libpan/draw_helper.cl
+index bf9e3328c49..a489aaeaaf0 100644
+--- a/src/panfrost/libpan/draw_helper.cl
++++ b/src/panfrost/libpan/draw_helper.cl
+@@ -1488,7 +1488,13 @@ draw_indexed_indirect_body(
+    const uint32_t first_instance = cmd->firstInstance;
+    const uint32_t instance_count = cmd->instanceCount;
+    const int32_t vertex_offset = cmd->vertexOffset;
+-   const uint32_t vertex_range = max_vertex - min_vertex + 1;
++   /* No index read (indexCount 0, or only restart indices) leaves the
++    * search's initial min > max: nothing to shade, NULL jobs. Without the
++    * check the range wraps to 2 (32-bit) or ~2^32 (16-bit) and the vertex
++    * job fetches attributes at min_vertex ~ 2^32.
++    */
++   const uint32_t vertex_range =
++      max_vertex < min_vertex ? 0 : max_vertex - min_vertex + 1;
+ 
+    struct panlib_draw_info draw = {
+       .idvs_job = idvs_job,
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 8d13e1f056e..af2102b712e 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -2166,6 +2166,19 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
+                                      VK_ERROR_OUT_OF_DEVICE_MEMORY);
+          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+       }
++   } else if (!emu && mesa_prim_has_adjacency(draw->info.prim)) {
++      /* The Bifrost tiler has no adjacency draw modes (translate_prim()):
++       * without a geometry shader the primitives go through a passthrough
++       * that drops the adjacent vertices.
++       */
++      emu = panvk_per_arch(passthrough_gs)(
++         to_panvk_device(cmdbuf->vk.base.device), cmdbuf->state.gfx.vs.shader,
++         draw->info.prim);
++      if (!emu) {
++         vk_command_buffer_set_error(&cmdbuf->vk,
++                                     VK_ERROR_OUT_OF_DEVICE_MEMORY);
++         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++      }
+    }
+    if (emu != cmdbuf->state.gfx.gs.emu) {
+       cmdbuf->state.gfx.gs.emu = emu;
+@@ -2543,6 +2556,40 @@ v7_polygon_cull(const struct panvk_cmd_buffer *cmdbuf)
+    return cull;
+ }
+ 
++/* Depth bias of the polygon-mode passthrough (jm-v7 018): a triangle drawn
++ * as lines or points is still a polygon to Vulkan, but the tiler only
++ * biases triangles. Only the least representable value of the depth
++ * format is advertised (depthBiasControl), as llvmpipe computes it.
++ */
++static void
++v7_polygon_bias(const struct panvk_cmd_buffer *cmdbuf,
++                struct panvk_gs_push *gs)
++{
++   const struct vk_rasterization_state *rs =
++      &cmdbuf->vk.dynamic_graphics_state.rs;
++
++   if (!rs->depth_bias.enable)
++      return;
++
++   const VkFormat zfmt = cmdbuf->state.gfx.render.z_attachment.fmt;
++   const bool zfloat = zfmt == VK_FORMAT_D32_SFLOAT ||
++                       zfmt == VK_FORMAT_D32_SFLOAT_S8_UINT;
++   double r = 1.0;
++   if (!zfloat) {
++      /* No depth attachment: nothing is tested, any r will do. */
++      const unsigned bits = zfmt == VK_FORMAT_D16_UNORM ||
++                                  zfmt == VK_FORMAT_D16_UNORM_S8_UINT
++                               ? 16
++                               : 24;
++      r = 1.0 / ((1u << bits) - 1);
++   }
++
++   gs->polygon_bias_float = zfloat;
++   gs->polygon_bias_units = rs->depth_bias.constant_factor * r;
++   gs->polygon_bias_slope = rs->depth_bias.slope_factor;
++   gs->polygon_bias_clamp = rs->depth_bias.clamp;
++}
++
+ /*
+  * The geometry shader as a compute job between the vertex job (dep_job_id)
+  * and the tiler job. Returns the job the tiler waits on, 0 on failure.
+@@ -2765,6 +2812,9 @@ emit_gs_job(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw,
+                           gfx_sysvals->viewport.offset.z},
+    };
+ 
++   if (gs->gs.polygon)
++      v7_polygon_bias(cmdbuf, &sysvals.gs);
++
+    struct panvk_shader_desc_state ds;
+    unsigned copy_job;
+    if (!emu_prepare_descs(cmdbuf, gs_shader, &sysvals, &ds, &copy_job))
+@@ -4606,11 +4656,8 @@ panvk_per_arch(CmdDrawIndexedIndirect)(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+    VK_FROM_HANDLE(panvk_buffer, buffer, _buffer);
+ 
+-   /* Because we don't currently advertise nullDescriptor for JM, it is only
+-    * valid to draw with a null index buffer if the draw accesses 0 indices.
+-    * For direct draws, this is covered by checks on instancedCount and
+-    * indexCount. For indirect draws we need to add an additional check, under
+-    * the assumption that if the index buffer is null, the draw must be empty.
++   /* A null index buffer is the zero page on v7 (CmdBindIndexBuffer2()),
++    * so a 0 size is a 0-byte buffer: nothing to draw.
+     */
+    if (drawCount == 0 || cmdbuf->state.gfx.ib.size == 0)
+       return;
+diff --git a/src/panfrost/vulkan/panvk_device.h b/src/panfrost/vulkan/panvk_device.h
+index 985bd9544f0..fad12220899 100644
+--- a/src/panfrost/vulkan/panvk_device.h
++++ b/src/panfrost/vulkan/panvk_device.h
+@@ -146,11 +146,13 @@ struct panvk_device {
+     * swizzle, and a storage image and texel buffer whose attribute buffer
+     * is 0 bytes, so loads return zeros and stores are dropped by the bounds
+     * check. zero_bo is zeroed memory nothing writes, what null vertex
+-    * buffers and UBOs point at (null SSBOs too, with size 0). Unused, and
++    * buffers, index buffers (maintenance6) and UBOs point at (null SSBOs
++    * too, with size 0); its first PANVK_NULL_ZERO_SIZE bytes. Unused, and
+     * the same layout, on v9+.
+     * From JimVulkan/mesa-unified-drivers (MIT, Copyright 2026 XclipseTools).
+     */
+ #define PANVK_NULL_UBO_ENTRIES 256
++#define PANVK_NULL_ZERO_SIZE (PANVK_NULL_UBO_ENTRIES * 16)
+    struct {
+       bool valid;
+       uint32_t tex[8], img[8], texel[8];
+diff --git a/src/panfrost/vulkan/panvk_gs.h b/src/panfrost/vulkan/panvk_gs.h
+index c776602f055..79ae42d730e 100644
+--- a/src/panfrost/vulkan/panvk_gs.h
++++ b/src/panfrost/vulkan/panvk_gs.h
+@@ -78,16 +78,23 @@ struct panvk_gs_push {
+    uint32_t in_general_stride;
+    uint32_t out_general_stride;
+    uint32_t num_input_prims;
+-   uint32_t pad;
++   /* Depth bias of the polygon-mode geometry shader (the tiler only biases
++    * the triangles it draws, not the lines or points it emits): the
++    * constant factor, already times the depth format's r unless
++    * polygon_bias_float (r then follows the primitive's largest depth), the
++    * slope factor and the clamp, in framebuffer depth units. All 0 without
++    * depth bias. They fill the vec4 padding of the fields around them.
++    */
++   uint32_t polygon_bias_float;
+    /* The viewport transform, applied by the emulation on the way out (and
+     * undone on the way in when the vertex shader already applied it).
+-    * Padded to vec4. These cannot come from nir_load_viewport_*: this runs
+-    * as COMPUTE with a compute sysval block.
++    * These cannot come from nir_load_viewport_*: this runs as COMPUTE with a
++    * compute sysval block.
+     */
+    float viewport_scale[3];
+-   float pad2;
++   float polygon_bias_units;
+    float viewport_offset[3];
+-   float pad3;
++   float polygon_bias_slope;
+    /* Input assembly. The vertex shader wrote one varying record per vertex
+     * it ran, each instance's records at instance_stride after the previous
+     * one. index_buf is the draw's first index, or 0 for a plain draw.
+@@ -153,7 +160,7 @@ struct panvk_gs_push {
+    uint32_t xfb_stream_slots;
+    uint32_t xfb_stream_idx;
+    uint32_t xfb_invocations;
+-   uint32_t pad4;
++   float polygon_bias_clamp;
+    /* Pipeline statistics (jm-v7 016), 0 when no query counts: four u64
+     * counter addresses, each 0 when not counted, that every live invocation
+     * adds to: geometry shader invocations (1), geometry shader primitives
+diff --git a/src/panfrost/vulkan/panvk_shader.h b/src/panfrost/vulkan/panvk_shader.h
+index a775d248912..19fb8529d71 100644
+--- a/src/panfrost/vulkan/panvk_shader.h
++++ b/src/panfrost/vulkan/panvk_shader.h
+@@ -615,9 +615,10 @@ struct panvk_shader {
+ #endif
+ 
+ #if PAN_ARCH < 9
+-   /* Vertex shaders with gs.vs_clip_space drawn without a geometry shader:
+-    * the passthrough geometry shaders, created on first use by input
+-    * primitive class.
++   /* Vertex shaders with gs.vs_clip_space drawn without a geometry shader,
++    * or any vertex shader drawn with an adjacency topology without one: the
++    * passthrough geometry shaders, created on first use by input primitive
++    * class.
+     */
+    struct panvk_shader *passthrough_gs[PANVK_XFB_GS_CLASS_COUNT];
+    /* fillModeNonSolid (jm-v7 018): the polygon-mode passthroughs, by mode
+@@ -815,7 +816,9 @@ VkResult panvk_per_arch(create_shader)(
+ #if PAN_ARCH < 9
+ /* The passthrough geometry shader a vertex shader with gs.vs_clip_space
+  * draws prim through when no geometry shader is bound (it captures the
+- * vertex shader's transform feedback), NULL when it cannot be made.
++ * vertex shader's transform feedback), NULL when it cannot be made. Any
++ * vertex shader gets one for an adjacency prim, which it emits without the
++ * adjacent vertices: the Bifrost tiler has no adjacency draw modes.
+  */
+ const struct panvk_shader *panvk_per_arch(passthrough_gs)(
+    struct panvk_device *dev, const struct panvk_shader *vs,
+diff --git a/src/panfrost/vulkan/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+index 7de7266c2dd..3fc73b7cf7d 100644
+--- a/src/panfrost/vulkan/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/panvk_vX_cmd_draw.c
+@@ -1234,14 +1234,27 @@ panvk_per_arch(CmdBindIndexBuffer2)(VkCommandBuffer commandBuffer,
+ #endif
+    } else {
+ #if PAN_ARCH < 9
++      /* nullDescriptor + maintenance6: every index reads 0. The Bifrost
++       * tiler has no index buffer bound and faults on address 0, so the
++       * indices come from the device's zero page (a nonzero size also keeps
++       * the indirect draws, which skip a 0-byte index buffer).
++       * ponytail: a draw reaching past the page (firstIndex + indexCount
++       * over 4 KB of indices) reads the rest of the null BO, then unmapped
++       * memory, as the tiler and the index range search have no bound.
++       */
++      const struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+       cmdbuf->state.gfx.ib.mem = NULL;
+-#endif
++      cmdbuf->state.gfx.ib.cpu_written_only = true;
++      cmdbuf->state.gfx.ib.size = PANVK_NULL_ZERO_SIZE;
++      cmdbuf->state.gfx.ib.dev_addr = dev->null_descs.zero_addr;
++#else
+       cmdbuf->state.gfx.ib.size = 0;
+       /* In case of NullDescriptors, we need to set a non-NULL address and rely
+        * on out-of-bounds behavior against the zero size of the buffer. Note
+        * that this only works for v10+, as v9 does not have a way to specify the
+        * index buffer size. */
+       cmdbuf->state.gfx.ib.dev_addr = PAN_ARCH >= 10 ? 0x1000 : 0;
++#endif
+    }
+    cmdbuf->state.gfx.ib.index_size = vk_index_type_to_bytes(indexType);
+ }
+diff --git a/src/panfrost/vulkan/panvk_vX_device.c b/src/panfrost/vulkan/panvk_vX_device.c
+index 15a83b9041e..647fe386e1b 100644
+--- a/src/panfrost/vulkan/panvk_vX_device.c
++++ b/src/panfrost/vulkan/panvk_vX_device.c
+@@ -597,7 +597,6 @@ panvk_queue_destroy(struct vk_queue *queue)
+ }
+ 
+ #if PAN_ARCH < 9
+-#define PANVK_NULL_ZERO_SIZE (PANVK_NULL_UBO_ENTRIES * 16)
+ #define PANVK_NULL_SCRATCH_SIZE 256
+ #define PANVK_NULL_SAMPLER_OFFSET (PANVK_NULL_ZERO_SIZE + PANVK_NULL_SCRATCH_SIZE)
+ #define PANVK_NULL_BO_SIZE (PANVK_NULL_SAMPLER_OFFSET + PANVK_DESCRIPTOR_SIZE)
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 560a83f4d76..3fe1a62055c 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -4882,10 +4882,12 @@ panvk_build_passthrough_gs(const struct panvk_shader_variant *vs,
+     * (a = -1/2 sum(x_i y_i+1 - x_i+1 y_i); the viewport offset cancels).
+     */
+    const bool poly_mode = poly_line || poly_point;
++   /* Clip-space z to add per unit of w (the depth bias), poly_mode only. */
++   nir_def *bias_dz = NULL;
+    if (poly_mode) {
+       nir_def *cull = load_sysval(&b, compute, 32, gs.polygon_cull);
+       nir_def *scale = load_sysval(&b, compute, 32, gs.viewport_scale);
+-      nir_def *fx[3], *fy[3];
++      nir_def *fx[3], *fy[3], *fz[3];
+       for (unsigned k = 0; k < 3; k++) {
+          nir_def *p = nir_load_array_var_imm(&b, in_vars[0],
+                                              classes[cls].emit[k]);
+@@ -4894,7 +4896,52 @@ panvk_build_passthrough_gs(const struct panvk_shader_variant *vs,
+                           nir_channel(&b, scale, 0));
+          fy[k] = nir_fmul(&b, nir_fmul(&b, nir_channel(&b, p, 1), rw),
+                           nir_channel(&b, scale, 1));
++         fz[k] = nir_fmul(&b, nir_fmul(&b, nir_channel(&b, p, 2), rw),
++                          nir_channel(&b, scale, 2));
+       }
++
++      /* Depth bias (see panvk_gs_push::polygon_bias_float), the tiler only
++       * biases triangles: m * slope + r * constant in framebuffer depth,
++       * clamped, as llvmpipe. m = max(|dz/dx|, |dz/dy|) of the triangle's
++       * plane, 0 for a degenerate one.
++       */
++      nir_def *units = load_sysval(&b, compute, 32, gs.polygon_bias_units);
++      nir_def *slope = load_sysval(&b, compute, 32, gs.polygon_bias_slope);
++      nir_def *clamp = load_sysval(&b, compute, 32, gs.polygon_bias_clamp);
++      nir_def *zfloat = load_sysval(&b, compute, 32, gs.polygon_bias_float);
++      nir_def *zoff = nir_channel(
++         &b, load_sysval(&b, compute, 32, gs.viewport_offset), 2);
++      nir_def *x1 = nir_fsub(&b, fx[1], fx[0]), *x2 = nir_fsub(&b, fx[2], fx[0]);
++      nir_def *y1 = nir_fsub(&b, fy[1], fy[0]), *y2 = nir_fsub(&b, fy[2], fy[0]);
++      nir_def *z1 = nir_fsub(&b, fz[1], fz[0]), *z2 = nir_fsub(&b, fz[2], fz[0]);
++      nir_def *det = nir_fsub(&b, nir_fmul(&b, x1, y2), nir_fmul(&b, x2, y1));
++      nir_def *dzdx = nir_fsub(&b, nir_fmul(&b, z1, y2), nir_fmul(&b, z2, y1));
++      nir_def *dzdy = nir_fsub(&b, nir_fmul(&b, x1, z2), nir_fmul(&b, x2, z1));
++      nir_def *m = nir_fdiv(&b, nir_fmax(&b, nir_fabs(&b, dzdx),
++                                         nir_fabs(&b, dzdy)),
++                            nir_fabs(&b, det));
++      m = nir_bcsel(&b, nir_feq_imm(&b, det, 0.0f), nir_imm_float(&b, 0.0f),
++                    m);
++      /* Float depth: r = 2^(exponent(max |z|) - 23). */
++      nir_def *maxz = nir_fmax(
++         &b, nir_fabs(&b, nir_fadd(&b, fz[0], zoff)),
++         nir_fmax(&b, nir_fabs(&b, nir_fadd(&b, fz[1], zoff)),
++                  nir_fabs(&b, nir_fadd(&b, fz[2], zoff))));
++      nir_def *rexp = nir_imax(
++         &b,
++         nir_iadd_imm(&b, nir_iand_imm(&b, maxz, 0xff << 23), -(23 << 23)),
++         nir_imm_int(&b, 0));
++      nir_def *r = nir_bcsel(&b, nir_ine_imm(&b, zfloat, 0), rexp,
++                             nir_imm_float(&b, 1.0f));
++      nir_def *bias = nir_ffma(&b, m, slope, nir_fmul(&b, units, r));
++      bias = nir_bcsel(&b, nir_fgt_imm(&b, clamp, 0.0f),
++                       nir_fmin(&b, bias, clamp), bias);
++      bias = nir_bcsel(&b, nir_flt_imm(&b, clamp, 0.0f),
++                       nir_fmax(&b, bias, clamp), bias);
++      /* z_fb = z / w * scale.z + offset.z. A 0 depth scale leaves z. */
++      nir_def *zs = nir_channel(&b, scale, 2);
++      bias_dz = nir_bcsel(&b, nir_feq_imm(&b, zs, 0.0f),
++                          nir_imm_float(&b, 0.0f), nir_fdiv(&b, bias, zs));
+       nir_def *sum = nir_imm_float(&b, 0.0f);
+       for (unsigned k = 0; k < 3; k++) {
+          const unsigned l = (k + 1) % 3;
+@@ -4918,6 +4965,12 @@ panvk_build_passthrough_gs(const struct panvk_shader_variant *vs,
+       const unsigned src = classes[cls].emit[v % classes[cls].nemit];
+       for (unsigned j = 0; j < n; j++) {
+          nir_def *val = nir_load_array_var_imm(&b, in_vars[j], src);
++         if (j == 0 && bias_dz) {
++            /* in_vars[0] is gl_Position. */
++            nir_def *w = nir_channel(&b, val, 3);
++            val = nir_vector_insert_imm(
++               &b, val, nir_ffma(&b, bias_dz, w, nir_channel(&b, val, 2)), 2);
++         }
+          if (val->bit_size == 16) {
+             switch (nir_alu_type_get_base_type(types[j])) {
+             case nir_type_float:
+@@ -4951,7 +5004,12 @@ panvk_per_arch(passthrough_gs)(struct panvk_device *dev,
+    const struct panvk_shader_variant *vs = panvk_shader_hw_variant(vs_shader);
+    const int cls = panvk_xfb_gs_class(prim);
+ 
+-   if (!vs->gs.vs_clip_space || cls < 0)
++   /* A vertex shader that writes screen space only goes through it for an
++    * adjacency topology, which the tiler cannot draw (see prepare_draw()).
++    */
++   if (cls < 0 ||
++       (!vs->gs.vs_clip_space && cls != PANVK_XFB_GS_LINES_ADJ &&
++        cls != PANVK_XFB_GS_TRIANGLES_ADJ))
+       return NULL;
+ 
+    /* Created by the first command buffer that needs it; a racing one
+-- 
+2.43.0
+

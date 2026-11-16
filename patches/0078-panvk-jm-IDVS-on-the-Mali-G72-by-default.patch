@@ -1,0 +1,50 @@
+From a104d4a1255d1cae13fef2afa4c0be39dea23fd4 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Sat, 14 Nov 2026 22:21:16 +0300
+Subject: [PATCH 78/78] panvk/jm: IDVS on the Mali-G72 by default
+
+The G72 kept VERTEX + TILER pairs because of a report that its
+INDEXED_VERTEX jobs could complete without writing positions. On a Galaxy
+A51 (G72 MP3) CTS matches with IDVS on, and ARMSX2 (NFS Most Wanted, about
++15% fps) and several Winlator games render correctly. The G71 was never
+tested and keeps it off; PANVK_V7_IDVS=0 still turns it off everywhere.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_vX_shader.c | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 2b2054e4ad2..bcd538b9f00 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -5370,11 +5370,9 @@ panvk_compile_shader(struct panvk_device *dev,
+     *   passthrough reads its varyings too;
+     * - it writes memory: the vertex store dedup (jm-v7 046) guards the
+     *   vertex job's invocations;
+-    * - G72, where JimVulkan measured INDEXED_VERTEX jobs completing
+-    *   without writing positions (the vendor driver uses VERTEX + TILER).
+-    * - any v6 GPU (G71/G72), until measured on a device.
++    * - the G71, never measured on a device (the G72 was: jm-v7 124).
+     * PANVK_V7_IDVS=0 keeps it off everywhere (A/B), =1 also allows it on
+-    * v6 and G76.
++    * the G71.
+     */
+    if (info->stage == MESA_SHADER_VERTEX && !vs_clip_space) {
+       const int idvs_env = panvk_v7_knob_idvs();
+@@ -5387,7 +5385,11 @@ panvk_compile_shader(struct panvk_device *dev,
+       /* G76 (Kirin 990): IDVS measured on NieR:Automata in Winlator
+        * halves the vertex/tiler time with no visible artefacts, so it is
+        * on there (PANVK_V7_IDVS=0 turns it off again). */
+-      const bool idvs_quirk = PAN_ARCH == 6 || prod == 0x6201 /* G72 */;
++      /* jm-v7 124: on for the G72 too. A Galaxy A51 (G72 MP3) passes CTS
++       * with it and renders ARMSX2 (NFS Most Wanted: +15% fps) and
++       * Winlator games correctly; the positions-not-written report did not
++       * reproduce. The G71 (0x6000) was never tested and keeps it off. */
++      const bool idvs_quirk = PAN_ARCH == 6 && prod == 0x6000 /* G71 */;
+       const bool polygon_mode =
+          panvk_v7_vs_may_draw_nonfill(&dev->vk.enabled_features, state);
+       nir_shader_gather_info(info->nir, nir_shader_get_entrypoint(info->nir));
+-- 
+2.43.0
+

@@ -1,0 +1,68 @@
+From d8d747a2bc905342ea9dba1eea27ee82c82ce550 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 16 Nov 2026 00:01:29 +0300
+Subject: [PATCH 82/84] panvk/jm: let IDVS jobs overlap the previous tiler job
+
+IDVS jobs no longer take the global dependency on the previous tiler job,
+so runs of small draws can overlap on the vertex/tiler slot instead of
+serializing. The hardware keeps primitive order through the tiler.
+
+NFS MW recomp on P40 (G76): 12 -> 21-22 fps, vertex/tiler time 31 -> 5.8 ms
+per frame. CTS (order, regress, sync2, wls, lwgsg, roa2, tilebar, extsync)
+identical with it off and on, on G76 and G72. PANVK_IDVS_OVERLAP=0 disables.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/lib/pan_jc.h                    | 9 ++++++++-
+ src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c | 8 ++++++++
+ 2 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/lib/pan_jc.h b/src/panfrost/lib/pan_jc.h
+index 4fb24690236..013b2f6d698 100644
+--- a/src/panfrost/lib/pan_jc.h
++++ b/src/panfrost/lib/pan_jc.h
+@@ -34,6 +34,12 @@ struct pan_jc {
+ 
+    /* The job index of the WRITE_VALUE job (before it has been created) */
+    unsigned write_value_index;
++
++   /* panvk (on by default, PANVK_IDVS_OVERLAP=0 disables): IDVS jobs do not
++    * wait for the previous tiler job, so small draws can overlap on the
++    * vertex/tiler slot. Relies on the hardware keeping the tiler's primitive
++    * order; CTS-clean and glitch-free on G76 and G72. */
++   bool idvs_no_tiler_dep;
+ };
+ 
+ #if defined(PAN_ARCH) && PAN_ARCH <= 9
+@@ -149,7 +155,8 @@ pan_jc_add_job(struct pan_jc *jc, enum mali_job_type type, bool barrier,
+       if (PAN_ARCH <= 5 && !jc->write_value_index)
+          jc->write_value_index = ++jc->job_index;
+ 
+-      if (jc->tiler_dep && !inject)
++      if (jc->tiler_dep && !inject &&
++          !(jc->idvs_no_tiler_dep && type == MALI_JOB_TYPE_INDEXED_VERTEX))
+          global_dep = jc->tiler_dep;
+       else if (PAN_ARCH <= 5)
+          global_dep = jc->write_value_index;
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+index c9a444880e8..241fe043325 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c
+@@ -787,6 +787,14 @@ panvk_per_arch(cmd_open_batch)(struct panvk_cmd_buffer *cmdbuf)
+       vk_zalloc(&cmdbuf->vk.pool->alloc, sizeof(*cmdbuf->cur_batch), 8,
+                 VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+    cmdbuf->cur_batch->jobs = UTIL_DYNARRAY_INIT;
++   {
++      static int idvs_overlap = -1;
++      if (idvs_overlap < 0) {
++         const char *e = getenv("PANVK_IDVS_OVERLAP");
++         idvs_overlap = !(e && e[0] == '0'); /* on by default; PANVK_IDVS_OVERLAP=0 turns it off */
++      }
++      cmdbuf->cur_batch->vtc_jc.idvs_no_tiler_dep = idvs_overlap;
++   }
+    cmdbuf->cur_batch->diag.opener = (uintptr_t)__builtin_return_address(0);
+    cmdbuf->cur_batch->diag.precomp = -1;
+    cmdbuf->cur_batch->after_frag = cmdbuf->next_batch_after_frag;
+-- 
+2.43.0
+

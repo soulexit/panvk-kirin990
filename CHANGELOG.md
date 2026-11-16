@@ -1,5 +1,39 @@
 # Changelog
 
+## soulexit PanVK 1.0.004 (release page) — 2026-11-16
+
+Released on [soulexit/panvk-bifrost-soulexit](https://github.com/soulexit/panvk-bifrost-soulexit)
+only; 1.0.003 plus patches 0077-0084 (tree `c99ebca`).
+
+- **Fewer GPU jobs per draw** (0077): descriptor copies are done on the CPU while recording instead
+  of a compute job per draw (`PANVK_DESC_COPY_CPU=0`: the job), and the record-time index range scan
+  is on by default for the PS2 emulators. GPU profile aids (fragment shader hash per batch).
+- **IDVS on the Mali-G72 by default** (0078); the G71 keeps it off, `PANVK_V7_IDVS=0` turns it off.
+  NFS Most Wanted in ARMSX2 on a Galaxy A51: 13 -> 17-18 fps with 0077.
+- **Less CPU per submit and per draw** (0079): one JOB_SUBMIT per vkQueueSubmit
+  (`PANVK_JM_SUBMIT_BATCH=0`), non-blocking kbase fd (`PANVK_KBASE_NONBLOCK=0`), job history on the
+  virtual counter, no relink of an unchanged shader set. NFS Most Wanted (A51): 16-30 fps by area.
+  The commit still says WIP; it has since passed CTS on the A51 and P40 with the rest of 1.0.004.
+- **Megabonk on Mali-G76 MC4** (0080, #10): the bounded load vectorizer used stale scalars after
+  replacing a load, which broke a compute shader.
+- **Adjacency topologies without a geometry shader** (0081) go through the passthrough GS (the
+  tiler has no adjacency modes: wrong pixels or DEVICE_LOST before); **maintenance6 null index
+  buffers** bind the zero page; **depth bias in LINE/POINT polygon mode** is computed in the GS;
+  an indexed indirect draw that reads no index gets NULL jobs.
+- **IDVS jobs overlap the previous tiler job** (0082, `PANVK_IDVS_OVERLAP=0` turns it off): runs
+  of small draws no longer serialize on the vertex/tiler slot. NFS Most Wanted (Xbox 360 recomp)
+  on the P40: 12 -> 21-22 fps.
+- **Push UBOs for NieR:Automata recomp** (0083, `nierrecomp` joins the PS2 emulators' list):
+  A51 7 -> 12 fps.
+- **Unused gl_PointSize dropped for IDVS** (0084, `PANVK_V7_STRIP_PSIZ=0` keeps it): Bifrost
+  cannot run a vertex shader that writes it as IDVS, and NieR's translator writes it everywhere.
+  Dropped when the pipeline cannot draw points. A static adjacency topology no longer gets IDVS
+  (the passthrough GS reads the vertex shader's varyings). NieR on the P40: 18 -> 22-30 fps.
+
+CTS on the A51 (draw order, regress, sync2, wls, lwgsg, roa2, tilebar, extsync, point size and
+topology lists): no new failures; 10 adjacency cases that failed now pass. P40: 0082 off and on
+identical.
+
 ## soulexit PanVK 1.0.003 (release page) — 2026-11-13
 
 Released on [soulexit/panvk-bifrost-soulexit](https://github.com/soulexit/panvk-bifrost-soulexit)

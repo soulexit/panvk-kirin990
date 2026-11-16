@@ -1,0 +1,50 @@
+From 0b0703939e978a5165eaea14cd70bc2a62fb8fb6 Mon Sep 17 00:00:00 2001
+From: soulexit <metehan.tanriverdi01@gmail.com>
+Date: Mon, 16 Nov 2026 00:01:29 +0300
+Subject: [PATCH 83/84] panvk/v7: push UBOs by default for nierrecomp
+
+Pushing dynamic UBOs into FAU cuts load/store traffic on NieR (Switch
+recomp): A51 (G72) 7 -> 12 fps, no glitches. The CPU reads the UBO at
+record time, so it stays limited to an app list (pcsx2, nierrecomp).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/panfrost/vulkan/panvk_v7_knobs.h | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/src/panfrost/vulkan/panvk_v7_knobs.h b/src/panfrost/vulkan/panvk_v7_knobs.h
+index 59895f0a46b..a7aa9ff2579 100644
+--- a/src/panfrost/vulkan/panvk_v7_knobs.h
++++ b/src/panfrost/vulkan/panvk_v7_knobs.h
+@@ -116,13 +116,27 @@ panvk_v7_is_pcsx2_app(void)
+    return v;
+ }
+ 
++/* Apps that write their dynamic uniform buffers before recording the draws
++ * that read them (UBO push reads them at record time): PCSX2 emulators and
++ * the NieR:Automata Switch recomp (7 -> 12 fps on the G72). */
++static inline bool
++panvk_v7_is_push_ubo_app(void)
++{
++   static int v = -1;
++   if (v < 0) {
++      const char *name = util_get_process_name();
++      v = panvk_v7_is_pcsx2_app() || (name && strstr(name, "nierrecomp"));
++   }
++   return v;
++}
++
+ static inline bool
+ panvk_v7_knob_push_ubo(void)
+ {
+    static int v = -1;
+    if (v < 0) {
+       const char *e = getenv("PANVK_V7_PUSH_UBO");
+-      v = (e && e[0]) ? e[0] != '0' : panvk_v7_is_pcsx2_app();
++      v = (e && e[0]) ? e[0] != '0' : panvk_v7_is_push_ubo_app();
+    }
+    return v;
+ }
+-- 
+2.43.0
+
